@@ -12,6 +12,8 @@ updates:
         patterns:
           - "*"
 
+  # Major versions (e.g. Deployer 9) are deliberate upgrades, not automatic PRs.
+  # Security updates are unaffected: this rule only uses update-types.
   - package-ecosystem: "composer"
     directory: "/"
     target-branch: "dev"
@@ -19,3 +21,7 @@ updates:
       interval: "weekly"
     cooldown:
       default-days: 5
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
