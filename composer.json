@@ -1,0 +1,13 @@
+{
+    "name": "nexgendevs/deploy-kit",
+    "description": "Shared Deployer recipe and GitHub workflow for Laravel apps on HestiaCP: releases built on the server, atomic switch, health check, rollback.",
+    "type": "library",
+    "license": "proprietary",
+    "require": {
+        "php": "^8.4",
+        "deployer/deployer": "^8.0"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

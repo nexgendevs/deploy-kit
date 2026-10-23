@@ -1,0 +1,51 @@
+name: CI
+
+# Checks this package on every push: composer.json is valid, the recipe
+# parses and Deployer can load it. No server is contacted.
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      DO_NOT_TRACK: 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: '8.4'
+          tools: composer:v2
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-lock
+
+      - name: Install Deployer
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Lint the recipe
+        run: php -l recipe/laravel-hestia.php
+
+      # A throwaway deploy.php with one fake site: proves the recipe loads and
+      # the task order is intact, without connecting anywhere.
+      - name: Load the recipe in Deployer
+        run: |
+          cat > deploy.php <<'PHP'
+          <?php
+          namespace Deployer;
+          require __DIR__.'/recipe/laravel-hestia.php';
+          set('repository', 'git@github.com:example/app.git');
+          site('app.example.test', 'dev')->setHostname('192.0.2.1')->setRemoteUser('app')->setDeployPath('/srv/app');
+          PHP
+          vendor/bin/dep tree deploy
+          vendor/bin/dep deploy branch=dev --plan

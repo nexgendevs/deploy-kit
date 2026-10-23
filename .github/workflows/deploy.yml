@@ -1,0 +1,111 @@
+name: deploy (reusable)
+
+# The shared deploy job. Each app's own deploy workflow calls it after its
+# tests pass, on pushes to dev and live/*:
+#
+#   jobs:
+#     tests:
+#       uses: ./.github/workflows/_tests.yml
+#     deploy:
+#       needs: tests
+#       uses: nexgendevs/deploy-kit/.github/workflows/deploy.yml@v1.0.0
+#       secrets:
+#         ssh_key: ${{ secrets.DEPLOY_SSH_KEY }}
+#
+# It deploys every site in the app's deploy.php whose branch matches the
+# pushed branch. The app repo provides deploy.php, deploy/known_hosts (the
+# server host keys GitHub trusts) and the nexgendevs/deploy-kit Composer
+# package (require-dev). Hostnames, users and folders stay in the app repo;
+# nothing about a particular server belongs in this repository.
+
+on:
+  workflow_call:
+    inputs:
+      php-version:
+        description: PHP version that runs Deployer on the runner
+        type: string
+        default: '8.4'
+    secrets:
+      ssh_key:
+        description: Private half of the key in the server user's authorized_keys
+        required: true
+      composer_auth:
+        description: Optional COMPOSER_AUTH JSON, for apps with private Composer repositories
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+
+    env:
+      # Deployer otherwise reports anonymous usage data to deployer.org.
+      DO_NOT_TRACK: 'true'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The live-branch check compares against the whole history of dev.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A site may only run code that exists on dev: the files being deployed
+      # must be identical to some commit on dev. This refuses a commit made
+      # directly on a live branch. (A hotfix is merged into dev first.)
+      - name: Check the code exists on dev
+        if: startsWith(github.ref_name, 'live/')
+        run: |
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          if ! git log --format=%T origin/dev | grep -qx "$tree"; then
+            echo "::error::$GITHUB_REF_NAME holds code that is not on dev. Merge the change into dev first, then release it with a PR from dev (or from the hotfix branch once it is merged into dev)."
+            exit 1
+          fi
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          tools: composer:v2
+          coverage: none
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: deploy-composer-${{ hashFiles('composer.lock') }}
+          restore-keys: deploy-composer-
+
+      # Only for Deployer and this recipe; the server installs its own dependencies.
+      - name: Install Deployer
+        env:
+          AUTH: ${{ secrets.composer_auth }}
+        run: |
+          if [ -n "$AUTH" ]; then export COMPOSER_AUTH="$AUTH"; fi
+          composer install --no-interaction --prefer-dist --no-progress --no-scripts
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.ssh_key }}
+        run: |
+          if [ -z "$SSH_KEY" ]; then
+            echo "::error::The deploy key secret is empty. Set DEPLOY_SSH_KEY in the app repo (Settings -> Secrets and variables -> Actions)."
+            exit 1
+          fi
+          if [ ! -s deploy/known_hosts ]; then
+            echo "::error::deploy/known_hosts is missing. Pin the server's host key there."
+            exit 1
+          fi
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Trust only the server keys pinned in the app repo.
+          cp deploy/known_hosts ~/.ssh/known_hosts
+          printf 'StrictHostKeyChecking yes\n' > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Deploy
+        run: vendor/bin/dep deploy "branch=$GITHUB_REF_NAME" --revision="$GITHUB_SHA" --no-interaction
