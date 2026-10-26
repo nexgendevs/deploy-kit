@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+#
+# Sets up a domain (one installation of an app) for deploy-kit on a
+# HestiaCP server, or checks one. Run as root, before the first deploy and
+# again after it. See server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: add-domain [--check] [--live] [--php <version>] <user> <domain> <database>
+
+Sets up <domain> under the HestiaCP user <user> (set up with add-user):
+  - checks the domain's DNS points at this server
+  - the web domain, with PHP-FPM <version> (default 8.4)
+  - Let's Encrypt, HTTPS redirect and HSTS
+  - the laravel web and proxy templates (web root current/public)
+  - shared/.env with a new APP_KEY and the database login, if missing
+  - the database <user>_<database>, with the password from shared/.env
+After the first deploy, run it again: it adds the scheduler's cron entry
+and checks the site (/up, HTTPS redirect, HSTS, no files exposed).
+
+<database> is the name without the "<user>_" HestiaCP adds (ngd -> <user>_ngd).
+
+--check  only report; change nothing
+--live   a live site: shared/.env gets APP_ENV=production (else staging)
+--php    PHP version, as in the app's deploy.php (default 8.4)
+
+Running it again is safe: it only adds what is missing, and never changes
+an existing shared/.env.
+TEXT
+}
+
+live=false
+php=8.4
+args=()
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        --live) live=true ;;
+        --php)
+            php=${2:-}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#args[@]} != 3)); then
+    usage
+    exit 1
+fi
+
+user=${args[0]}
+domain=${args[1]}
+db_short=${args[2]#"$user"_}
+db_name="${user}_$db_short"
+
+if [[ ! $user =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    die "'$user' is not a valid user name."
+fi
+
+if [[ ! $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    die "'$domain' is not a domain name (lower case, no scheme or path)."
+fi
+
+if [[ ! $db_short =~ ^[a-z0-9_]+$ ]]; then
+    die "'$db_short' is not a valid database name (a-z, 0-9, _)."
+fi
+
+if [[ ! $php =~ ^[0-9]+\.[0-9]+$ ]]; then
+    die "'$php' is not a PHP version (for example 8.4)."
+fi
+
+require_root_and_hestia
+
+backend="PHP-${php/./_}"
+php_bin="/usr/bin/php$php"
+
+if ! user_exists "$user"; then
+    die "There is no HestiaCP user $user. Set it up with add-user first."
+fi
+
+if [[ $(user_field "$user" SHELL) != bash ]]; then
+    die "$user's shell is not bash. Run add-user for $user first."
+fi
+
+home=$(user_field "$user" HOME)
+deploy_path="$home/web/$domain/public_html"
+env_file="$deploy_path/shared/.env"
+current="$deploy_path/current"
+conf_dir="$home/conf/web/$domain"
+
+# has_template <list command> <name>. The list is read in full first: with
+# pipefail, `v-list-... | grep -q` can fail when grep stops reading early.
+has_template() {
+    local templates
+    templates=$("$1" plain)
+    grep -Eq "^$2[[:space:]]*\$" <<< "$templates"
+}
+
+# One-time server setup (server/README.md). Without it a deploy would look
+# fine but keep serving one release.
+if ! has_template v-list-web-templates laravel || ! has_template v-list-web-templates-proxy laravel; then
+    die "The laravel web and proxy templates are missing (server/README.md, server checklist)."
+fi
+
+if ! has_template v-list-web-templates-backend "$backend"; then
+    die "There is no PHP-FPM backend template $backend. Is PHP $php installed in HestiaCP?"
+fi
+
+if [[ ! -x $php_bin ]]; then
+    die "$php_bin was not found."
+fi
+
+if ! grep -Eqs '^[[:space:]]*opcache\.revalidate_path[[:space:]]*=[[:space:]]*1' "/etc/php/$php/fpm/conf.d/99-release-switch.ini"; then
+    die "/etc/php/$php/fpm/conf.d/99-release-switch.ini is missing (server/README.md, server checklist)."
+fi
+
+if $check_only; then
+    echo "Checking $domain for $user (nothing will be changed)"
+else
+    echo "Setting up $domain for $user"
+fi
+
+domain_exists() {
+    v-list-web-domain "$user" "$domain" json > /dev/null 2>&1
+}
+
+# web_field <field>: one field of v-list-web-domain, or nothing.
+web_field() {
+    v-list-web-domain "$user" "$domain" json | jq -r --arg d "$domain" --arg f "$1" '.[$d][$f] // ""'
+}
+
+# This server's public IPv4 addresses, one per line.
+server_ips() {
+    v-list-sys-ips json | jq -r 'to_entries[] | if (.value.NAT // "") != "" then .value.NAT else .key end'
+}
+
+# Prints why <name> does not point at this server, or nothing when it does.
+# Asks a public resolver, so a DNS zone on this server cannot hide a problem.
+dns_problem() {
+    local name=$1 ip a_records aaaa_records ips
+    a_records=$(dig +short +time=5 +tries=2 A "$name" @1.1.1.1 | grep -E '^[0-9.]+$' || true)
+    aaaa_records=$(dig +short +time=5 +tries=2 AAAA "$name" @1.1.1.1 | grep ':' || true)
+    ips=$(server_ips)
+
+    if [[ -z $a_records ]]; then
+        echo "$name has no A record"
+        return
+    fi
+
+    for ip in $a_records; do
+        if ! grep -qxF "$ip" <<< "$ips"; then
+            echo "$name points at $ip, not at this server"
+            return
+        fi
+    done
+
+    if [[ -n $aaaa_records ]]; then
+        echo "$name has an AAAA (IPv6) record, but HestiaCP serves it over IPv4 only, so Let's Encrypt would fail"
+    fi
+}
+
+# env_value <key>: the value in shared/.env without surrounding quotes, or
+# nothing.
+env_value() {
+    local value
+    value=$(grep -E "^$1=" "$env_file" 2> /dev/null | tail -n 1 || true)
+    value=${value#*=}
+    value=${value%$'\r'}
+
+    if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+        value=${BASH_REMATCH[1]}
+    fi
+
+    printf '%s' "$value"
+}
+
+http_code() {
+    curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "$1" 2> /dev/null || true
+}
+
+section 'Web domain'
+
+if domain_exists; then
+    ok "$domain"
+else
+    problem=$(dns_problem "$domain")
+
+    if $check_only; then
+        todo "web domain $domain${problem:+ (first: $problem)}, and everything after it"
+        finish
+    fi
+
+    if [[ -n $problem ]]; then
+        die "$problem. Point its DNS at this server and run this again; nothing was changed."
+    fi
+
+    run v-add-web-domain "$user" "$domain"
+    added "$domain"
+fi
+
+aliases=$(web_field ALIAS)
+if [[ -n $aliases ]]; then
+    say note "aliases: $aliases"
+fi
+
+if [[ $(web_field BACKEND) == "$backend" ]]; then
+    ok "PHP-FPM backend $backend"
+elif needs "PHP-FPM backend $backend"; then
+    run v-change-web-domain-backend-tpl "$user" "$domain" "$backend"
+    added "PHP-FPM backend $backend"
+fi
+
+section 'HTTPS'
+
+if [[ $(web_field SSL) == yes ]]; then
+    if [[ $(web_field LETSENCRYPT) == yes ]]; then
+        ok "Let's Encrypt certificate"
+    else
+        ok "certificate (not from Let's Encrypt; renew it yourself)"
+    fi
+else
+    problems=()
+    IFS=',' read -ra names <<< "$domain${aliases:+,$aliases}"
+    for name in "${names[@]}"; do
+        problem=$(dns_problem "$name")
+        if [[ -n $problem ]]; then
+            problems+=("$problem")
+        fi
+    done
+
+    if ((${#problems[@]} > 0)); then
+        if $check_only; then
+            todo "Let's Encrypt certificate (first: ${problems[*]})"
+        else
+            printf '  %s\n' "${problems[@]}" >&2
+            die "Fix the DNS above and run this again. An alias nobody needs can go: v-delete-web-domain-alias $user $domain <alias>"
+        fi
+    elif needs "Let's Encrypt certificate"; then
+        run v-add-letsencrypt-domain "$user" "$domain" ${aliases:+"$aliases"}
+        added "Let's Encrypt certificate"
+    fi
+fi
+
+if [[ $(web_field SSL_FORCE) == yes ]]; then
+    ok 'HTTP redirects to HTTPS'
+elif needs 'HTTP redirects to HTTPS'; then
+    run v-add-web-domain-ssl-force "$user" "$domain"
+    added 'HTTP redirects to HTTPS'
+fi
+
+if [[ $(web_field SSL_HSTS) == yes ]]; then
+    ok 'HSTS'
+elif needs 'HSTS'; then
+    run v-add-web-domain-ssl-hsts "$user" "$domain"
+    added 'HSTS'
+fi
+
+section 'Web root (current/public)'
+
+# A custom document root is resolved through the current symlink once,
+# which would freeze the site on one release.
+if [[ -z $(web_field CUSTOM_DOCROOT) ]]; then
+    ok 'no custom document root'
+elif needs 'custom document root off'; then
+    run v-change-web-domain-docroot "$user" "$domain" default
+    added 'custom document root off'
+fi
+
+if [[ $(web_field TPL) == laravel ]]; then
+    ok 'web template laravel'
+elif needs 'web template laravel'; then
+    run v-change-web-domain-tpl "$user" "$domain" laravel
+    added 'web template laravel'
+fi
+
+# The default proxy template serves static files (json, pdf, jpg...) from
+# all of public_html, which would expose shared/storage.
+if [[ $(web_field PROXY) == laravel ]]; then
+    ok 'proxy template laravel'
+elif needs 'proxy template laravel'; then
+    run v-change-web-domain-proxy-tpl "$user" "$domain" laravel
+    added 'proxy template laravel'
+fi
+
+web_roots=$(grep -hsE '^[[:space:]]*(DocumentRoot|root)[[:space:]]' \
+    "$conf_dir/apache2.conf" "$conf_dir/apache2.ssl.conf" "$conf_dir/nginx.conf" "$conf_dir/nginx.ssl.conf" \
+    | awk '{ print $2 }' | tr -d ';' | sort -u || true)
+
+if [[ $web_roots == "$current/public" ]]; then
+    ok "Apache and nginx serve ${current#"$home"/}/public"
+elif ! $check_only || [[ $(web_field TPL) == laravel && $(web_field PROXY) == laravel ]]; then
+    warn "the web server configuration in $conf_dir serves $(paste -sd ' ' - <<< "$web_roots"), not $current/public"
+fi
+
+section 'shared/.env'
+
+if [[ -L $env_file ]]; then
+    die "$env_file is a symbolic link. Replace it with a file."
+fi
+
+if [[ -s $env_file ]]; then
+    ok 'exists (never changed by this script)'
+elif needs 'shared/.env'; then
+    if $live; then
+        app_env=production
+    else
+        app_env=staging
+    fi
+
+    env_content=$(
+        printf '%s\n' \
+            "# Written by deploy-kit's add-domain on $(date +%F). Deploys never change this file." \
+            "# Add the app's own settings at the end (its docs/deployment.md lists them)." \
+            '' \
+            "APP_ENV=$app_env" \
+            "APP_KEY=base64:$(openssl rand -base64 32)" \
+            'APP_DEBUG=false' \
+            "APP_URL=https://$domain" \
+            'LOG_LEVEL=info' \
+            '' \
+            'DB_CONNECTION=mysql' \
+            'DB_HOST=127.0.0.1' \
+            'DB_PORT=3306' \
+            "DB_DATABASE=$db_name" \
+            "DB_USERNAME=$db_name" \
+            "DB_PASSWORD=$(random_password)" \
+            '' \
+            'SESSION_SECURE_COOKIE=true'
+    )
+
+    run runuser -u "$user" -- mkdir -p "$deploy_path/shared"
+    run runuser -u "$user" -- bash -c 'set -o noclobber && umask 077 && cat > "$1"' _ "$env_file" <<< "$env_content"
+    added "shared/.env (APP_ENV=$app_env, new APP_KEY, database login)"
+fi
+
+if [[ -s $env_file ]]; then
+    env_mode=$(stat -c '%a %U' "$env_file")
+    if [[ $env_mode == "600 $user" ]]; then
+        ok "mode 600, owned by $user"
+    elif [[ $env_mode == *" $user" ]] && needs 'mode 600'; then
+        run runuser -u "$user" -- chmod 600 "$env_file"
+        added 'mode 600'
+    elif [[ $env_mode != *" $user" ]]; then
+        warn "owned by ${env_mode#* }, not $user"
+    fi
+
+    if [[ -n $(env_value APP_KEY) ]]; then
+        ok 'APP_KEY set'
+    else
+        warn 'APP_KEY is empty'
+    fi
+
+    if [[ $(env_value APP_URL) == "https://$domain" ]]; then
+        ok "APP_URL=https://$domain"
+    else
+        warn "APP_URL is '$(env_value APP_URL)', not https://$domain"
+    fi
+
+    if $live && [[ $(env_value APP_ENV) != production ]]; then
+        warn "APP_ENV is '$(env_value APP_ENV)'; a live site needs production"
+    else
+        ok "APP_ENV=$(env_value APP_ENV)"
+    fi
+
+    if [[ $(env_value APP_DEBUG) =~ ^(false|0)$ ]]; then
+        ok 'APP_DEBUG=false'
+    else
+        warn "APP_DEBUG is '$(env_value APP_DEBUG)'; it must be false on a server"
+    fi
+fi
+
+section "Database $db_name"
+
+db_password=$(env_value DB_PASSWORD)
+env_database=$(env_value DB_DATABASE)
+
+database_exists() {
+    jq -e --arg d "$db_name" 'has($d)' <<< "$(v-list-databases "$user" json)" > /dev/null
+}
+
+check_database_login() {
+    local db_host db_port
+    db_host=$(env_value DB_HOST)
+    db_port=$(env_value DB_PORT)
+
+    # --no-defaults: root's ~/.my.cnf would override the login under test.
+    if MYSQL_PWD=$db_password mariadb --no-defaults -h "${db_host:-127.0.0.1}" -P "${db_port:-3306}" \
+        -u "$(env_value DB_USERNAME)" -e 'SELECT 1' "$db_name" > /dev/null 2>&1; then
+        ok 'the login in shared/.env works'
+    else
+        warn "the login in shared/.env fails. Set a new password with v-change-database-password $user $db_name and put it in DB_PASSWORD"
+    fi
+}
+
+if [[ -s $env_file && $env_database != "$db_name" ]]; then
+    # The login in shared/.env is for another database: never create this
+    # one with it.
+    if ! $check_only; then
+        die "shared/.env uses database '$env_database', not $db_name. Pass that name, or fix DB_* in shared/.env."
+    fi
+
+    warn "shared/.env uses database '$env_database', not $db_name"
+elif database_exists; then
+    ok "$db_name exists"
+
+    if [[ -n $db_password ]]; then
+        check_database_login
+    fi
+elif [[ -z $db_password ]]; then
+    if $check_only; then
+        todo "database $db_name"
+    else
+        die "shared/.env has no DB_PASSWORD to create $db_name with. Add one and run this again."
+    fi
+elif needs "database $db_name"; then
+    make_secret_file "$db_password"
+    run v-add-database "$user" "$db_short" "$db_short" "$secret_path" mysql
+    added "$db_name, with the login from shared/.env"
+    check_database_login
+fi
+
+section 'After the first deploy'
+
+if [[ ! -L $current ]]; then
+    later 'scheduler cron entry and site checks: not deployed yet'
+    echo
+    echo 'Next:'
+    echo "  1. Add the app's own settings to $env_file"
+    echo "     (its docs/deployment.md lists them), as $user."
+    echo "  2. Add $domain to the app's deploy.php and deploy."
+    echo '  3. Run this again: it adds the cron entry and checks the site.'
+    echo "  4. Create the first administrator (the app's docs/deployment.md)."
+    finish
+fi
+
+ok "deployed (current -> $(readlink "$current"))"
+
+cron_command="cd $current && $php_bin artisan schedule:run >> /dev/null 2>&1"
+
+if v-list-cron-jobs "$user" json | jq -e --arg c "$current" \
+    'any(.[]; (.CMD | contains($c)) and (.CMD | contains("schedule:run")))' > /dev/null; then
+    ok 'scheduler cron entry'
+elif needs 'scheduler cron entry'; then
+    run v-add-cron-job "$user" '*' '*' '*' '*' '*' "$cron_command"
+    added 'scheduler cron entry'
+fi
+
+url="https://$domain"
+
+code=$(http_code "$url/up")
+if [[ $code == 200 ]]; then
+    ok "$url/up answers 200"
+else
+    warn "$url/up answers $code (shared/storage/logs/laravel.log may say why)"
+fi
+
+read -r code location < <(curl -sS -o /dev/null --max-time 15 -w '%{http_code} %{redirect_url}\n' "http://$domain/up" 2> /dev/null || echo 000)
+if [[ $code == 301 && $location == "$url/"* ]]; then
+    ok "http:// redirects to https://"
+else
+    warn "http://$domain/up answers $code ${location:-}, not a 301 to $url"
+fi
+
+headers=$(curl -sS -o /dev/null -D - --max-time 15 "$url/up" 2> /dev/null || true)
+if grep -qi '^strict-transport-security:' <<< "$headers"; then
+    ok 'HSTS header sent'
+else
+    warn 'no Strict-Transport-Security header on /up'
+fi
+
+exposed=()
+for path in /.env /shared/.env /current/.env /composer.json /package.json "/$(readlink "$current")/composer.json"; do
+    code=$(http_code "$url$path")
+    if [[ $code != 404 ]]; then
+        exposed+=("$path ($code)")
+    fi
+done
+
+if ((${#exposed[@]} == 0)); then
+    ok '/.env, /shared/.env, /composer.json and the like answer 404'
+else
+    warn "these should answer 404: ${exposed[*]}"
+fi
+
+finish
