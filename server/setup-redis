@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+#
+# Sets up the two Redis instances that apps deployed with deploy-kit share,
+# or checks them. Once per server, as root. Domains then get their own Redis
+# user from add-domain (new domains) or use-redis (existing ones). See
+# server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: setup-redis [--check]
+
+Sets up the Redis instances the apps share, next to any Redis already on the
+server (which is left alone):
+  cache  port 6380  256 MB, evicts the least recently used keys, nothing on disk
+  data   port 6381  512 MB for sessions and queues, never evicts, saved to disk
+Both listen on localhost only, as systemd's redis-server@cache and
+redis-server@data, with their settings from server/redis/ in this repository.
+Logins are ACL users: "admin" for these scripts (its password is in
+/etc/redis/admin.pass, readable by root only) and one user per domain.
+It also sets vm.overcommit_memory = 1, which Redis needs to save reliably.
+
+--check  only report; change nothing
+
+Running it again is safe: it only adds what is missing. A settings file that
+differs from this repository's is replaced and its instance restarted.
+TEXT
+}
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) die "Unknown argument $1 (see --help)." ;;
+    esac
+    shift
+done
+
+require_root_and_hestia
+
+server_dir=$(dirname "$(readlink -f "$0")")
+
+for needed in /usr/bin/redis-server /usr/bin/redis-cli /lib/systemd/system/redis-server@.service; do
+    if [[ ! -e $needed ]]; then
+        die "$needed is missing. Install Redis first: apt install redis-server"
+    fi
+done
+
+if ! id redis > /dev/null 2>&1; then
+    die "There is no redis system user. Install Redis first: apt install redis-server"
+fi
+
+if $check_only; then
+    echo 'Checking the shared Redis instances (nothing will be changed)'
+else
+    echo 'Setting up the shared Redis instances'
+fi
+
+section 'Server'
+
+sysctl_file=/etc/sysctl.d/90-redis.conf
+if [[ $(sysctl -n vm.overcommit_memory) == 1 ]] && grep -qs '^vm.overcommit_memory = 1$' "$sysctl_file"; then
+    ok 'vm.overcommit_memory = 1'
+elif needs 'vm.overcommit_memory = 1'; then
+    refuse_in_check_mode 'sysctl'
+    printf '%s\n' '# deploy-kit: Redis needs this to save in the background reliably.' 'vm.overcommit_memory = 1' > "$sysctl_file"
+    run sysctl -p "$sysctl_file"
+    added "vm.overcommit_memory = 1 ($sysctl_file)"
+fi
+
+# PHP talks to Redis through the phpredis extension, in the CLI (queue
+# workers, artisan) and in PHP-FPM (the sites).
+for fpm_bin in /usr/sbin/php-fpm[0-9]*; do
+    php_version=${fpm_bin##*php-fpm}
+    cli_modules=$("/usr/bin/php$php_version" -m 2> /dev/null || true)
+    fpm_modules=$("$fpm_bin" -m 2> /dev/null || true)
+
+    if grep -qix redis <<< "$cli_modules" && grep -qix redis <<< "$fpm_modules"; then
+        ok "PHP $php_version has the redis extension (CLI and FPM)"
+    else
+        warn "PHP $php_version lacks the redis extension in the CLI or FPM: apt install php$php_version-redis"
+    fi
+done
+
+if [[ -s $redis_admin_password_file && $(stat -c '%a %U' "$redis_admin_password_file") == '600 root' ]]; then
+    ok "admin password in $redis_admin_password_file (root only)"
+elif [[ -s $redis_admin_password_file ]]; then
+    warn "$redis_admin_password_file must be mode 600 and owned by root"
+elif needs "admin password in $redis_admin_password_file"; then
+    refuse_in_check_mode 'admin password'
+    (umask 077 && random_password > "$redis_admin_password_file")
+    added "admin password in $redis_admin_password_file (root only)"
+fi
+
+for instance in "${redis_instances[@]}"; do
+    name=${instance%%:*}
+    port=${instance##*:}
+    conf=/etc/redis/redis-$name.conf
+    acl=/etc/redis/users-$name.acl
+    data_dir=/var/lib/redis/$name
+    restart=false
+
+    section "Redis $name (port $port)"
+
+    if [[ -d $data_dir ]]; then
+        ok "$data_dir"
+    elif needs "$data_dir"; then
+        run install -d -o redis -g redis -m 750 "$data_dir"
+        added "$data_dir"
+    fi
+
+    if [[ ! -f $conf ]]; then
+        if needs "$conf"; then
+            run install -o redis -g redis -m 640 "$server_dir/redis/redis-$name.conf" "$conf"
+            added "$conf"
+        fi
+    elif cmp -s "$server_dir/redis/redis-$name.conf" "$conf"; then
+        ok "$conf matches server/redis/redis-$name.conf"
+    elif needs "$conf differs from server/redis/redis-$name.conf"; then
+        run install -o redis -g redis -m 640 "$server_dir/redis/redis-$name.conf" "$conf"
+        restart=true
+        added "$conf replaced (instance restarts)"
+    fi
+
+    # Created once; afterwards Redis rewrites it (ACL SAVE) as users change.
+    if [[ -f $acl ]]; then
+        ok "$acl"
+    elif needs "$acl (default user off, admin user)"; then
+        refuse_in_check_mode 'ACL file'
+        admin_hash=$(printf '%s' "$(cat "$redis_admin_password_file")" | sha256sum | cut -d ' ' -f 1)
+        (umask 027 && printf '%s\n' 'user default off' "user admin on #$admin_hash ~* &* +@all" > "$acl")
+        run chown redis:redis "$acl"
+        added "$acl (default user off, admin user)"
+    fi
+
+    if systemctl is-enabled --quiet "redis-server@$name" && systemctl is-active --quiet "redis-server@$name"; then
+        if $restart; then
+            run systemctl restart "redis-server@$name"
+        fi
+        ok "redis-server@$name enabled and running"
+    elif needs "redis-server@$name enabled and running"; then
+        run systemctl enable --now "redis-server@$name"
+        added "redis-server@$name enabled and running"
+    fi
+
+    if [[ ! -s $redis_admin_password_file ]] || ! systemctl is-active --quiet "redis-server@$name"; then
+        continue
+    fi
+
+    if ! reply=$(redis_admin "$port" PING) || [[ $reply != PONG ]]; then
+        warn "admin cannot log in to Redis $name (wrong password in $redis_admin_password_file?)"
+        continue
+    fi
+
+    # Replies, one per line: maxmemory, <bytes>, maxmemory-policy, <policy>.
+    mapfile -t settings < <(redis_admin "$port" 'CONFIG GET maxmemory' 'CONFIG GET maxmemory-policy')
+    ok "admin logs in; maxmemory $((${settings[1]:-0} / 1024 / 1024)) MB, ${settings[3]:-?}"
+
+    # The default user takes logins without a name; it must stay off.
+    if [[ $(redis_admin "$port" 'ACL GETUSER default') =~ (^|$'\n')on($'\n'|$) ]]; then
+        warn "the default user is on: anyone on the server can use Redis $name without a password"
+    fi
+
+    domain_users=$(redis_admin "$port" 'ACL USERS' | grep -vx -e admin -e default | paste -sd ' ' - || true)
+    say note "domain users: ${domain_users:-none yet}"
+done
+
+finish

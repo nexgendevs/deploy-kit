@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+#
+# Moves an existing domain's cache and sessions to the shared Redis
+# instances (setup-redis), or checks it. Once per domain, as root; domains
+# set up by add-domain since Redis get it from the start. See
+# server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: use-redis [--check] [--php <version>] <user> <domain>
+
+Moves <domain>'s cache and sessions to the shared Redis instances (run
+setup-redis first):
+  - checks the deployed app reads REDIS_CACHE_PORT, so caches go to the
+    cache instance and sessions to the data instance
+  - creates the domain's Redis user on both instances: it may only use keys
+    under "<domain>:"
+  - backs up shared/.env (.env.bak-<date>), then sets CACHE_STORE=redis,
+    SESSION_DRIVER=redis and the REDIS_* login, ports and prefix in it
+  - rebuilds the config cache (artisan optimize) and checks the site
+Everybody signed in to the domain is signed out once: sessions do not move.
+Queues stay as they are; they move to Redis together with Horizon.
+
+--check  only report; change nothing
+--php    PHP version, as in the app's deploy.php (default 8.4)
+
+Running it again is safe: it only changes what is missing.
+TEXT
+}
+
+php=8.4
+args=()
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        --php)
+            php=${2:-}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#args[@]} != 2)); then
+    usage
+    exit 1
+fi
+
+user=${args[0]}
+domain=${args[1]}
+
+if [[ ! $user =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    die "'$user' is not a valid user name."
+fi
+
+if [[ ! $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    die "'$domain' is not a domain name (lower case, no scheme or path)."
+fi
+
+if [[ ! $php =~ ^[0-9]+\.[0-9]+$ ]]; then
+    die "'$php' is not a PHP version (for example 8.4)."
+fi
+
+require_root_and_hestia
+
+if ! user_exists "$user"; then
+    die "There is no HestiaCP user $user."
+fi
+
+home=$(user_field "$user" HOME)
+env_file="$home/web/$domain/public_html/shared/.env"
+current="$home/web/$domain/public_html/current"
+php_bin="/usr/bin/php$php"
+
+if [[ -L $env_file || ! -s $env_file ]]; then
+    die "$env_file is missing (or a symbolic link). Set the domain up with add-domain first."
+fi
+
+if ! redis_ready; then
+    die "The shared Redis instances are not set up or not running. Run setup-redis first."
+fi
+
+if $check_only; then
+    echo "Checking Redis for $domain (nothing will be changed)"
+else
+    echo "Moving $domain's cache and sessions to Redis"
+fi
+
+# set_env <key> <value>: sets KEY=value in shared/.env as the site user,
+# replacing every KEY= line, or adding one at the end. The value goes over
+# stdin, so it shows up neither in the process list nor in this output.
+set_env() {
+    refuse_in_check_mode "set $1"
+    printf '          $ set %s in shared/.env\n' "$1"
+
+    # shellcheck disable=SC2016
+    runuser -u "$user" -- bash -c '
+        IFS= read -r value
+        if grep -q "^$2=" "$1"; then
+            sed -i "s|^$2=.*|$2=$value|" "$1"
+        else
+            printf "%s=%s\n" "$2" "$value" >> "$1"
+        fi' _ "$env_file" "$1" <<< "$2" || die "Could not set $1 in $env_file."
+}
+
+section 'App'
+
+if [[ ! -L $current ]]; then
+    later 'not deployed yet: the settings take effect with the first deploy'
+elif grep -qs 'REDIS_CACHE_PORT' "$current/config/database.php"; then
+    ok "the deployed app reads REDIS_CACHE_PORT (current -> $(readlink "$current"))"
+else
+    die "The deployed app's config/database.php ignores REDIS_CACHE_PORT, so caches would land in the data instance. Deploy the app's Redis config change first; nothing was changed."
+fi
+
+section "Redis user $domain"
+
+if [[ $(env_value REDIS_USERNAME) == "$domain" && -n $(env_value REDIS_PASSWORD) ]]; then
+    password=$(env_value REDIS_PASSWORD)
+    problem=$(redis_user_problem "$domain" "$password")
+else
+    password=$(random_password)
+    problem='no Redis login in shared/.env yet'
+fi
+
+if [[ -z $problem ]]; then
+    ok "logs in to cache and data with the password in shared/.env; own keys only"
+elif needs "Redis user $domain on cache and data ($problem)"; then
+    redis_set_user "$domain" "$password"
+    problem=$(redis_user_problem "$domain" "$password")
+
+    if [[ -n $problem ]]; then
+        die "$problem"
+    fi
+
+    added "Redis user $domain on cache and data; own keys only"
+fi
+
+section 'shared/.env'
+
+keys=(CACHE_STORE SESSION_DRIVER REDIS_CLIENT REDIS_HOST REDIS_PORT REDIS_CACHE_PORT REDIS_USERNAME REDIS_PASSWORD REDIS_PREFIX)
+values=(redis redis phpredis 127.0.0.1 "$redis_data_port" "$redis_cache_port" "$domain" "$password" "$domain:")
+changes=()
+
+for i in "${!keys[@]}"; do
+    if [[ $(env_value "${keys[i]}") != "${values[i]}" ]]; then
+        changes+=("$i")
+    fi
+done
+
+env_changed=false
+
+if ((${#changes[@]} == 0)); then
+    ok "CACHE_STORE=redis, SESSION_DRIVER=redis, REDIS_* for $domain"
+else
+    names=$(for i in "${changes[@]}"; do printf '%s ' "${keys[i]}"; done)
+
+    if needs "set ${names% } in shared/.env"; then
+        backup="$env_file.bak-$(date +%Y%m%d-%H%M%S)"
+        run runuser -u "$user" -- cp -p "$env_file" "$backup"
+
+        for i in "${changes[@]}"; do
+            set_env "${keys[i]}" "${values[i]}"
+        done
+
+        env_changed=true
+        added "${names% } (backup: shared/$(basename "$backup"))"
+    fi
+fi
+
+say note "QUEUE_CONNECTION stays $(env_value QUEUE_CONNECTION) until Horizon"
+
+section 'Site'
+
+if [[ ! -L $current ]]; then
+    later 'site checks: run this again after the first deploy'
+    finish
+fi
+
+if $env_changed; then
+    run runuser -u "$user" -- "$php_bin" "$current/artisan" optimize
+fi
+
+drivers=$(runuser -u "$user" -- "$php_bin" "$current/artisan" about --only=drivers --json 2> /dev/null || true)
+cache_driver=$(jq -r '.drivers.cache // ""' <<< "$drivers" 2> /dev/null || true)
+session_driver=$(jq -r '.drivers.session // ""' <<< "$drivers" 2> /dev/null || true)
+
+if [[ $cache_driver == redis && $session_driver == redis ]]; then
+    ok 'the app uses Redis for its cache and sessions'
+elif $check_only && ((${#changes[@]} > 0)); then
+    later "the app uses ${cache_driver:-?} / ${session_driver:-?} for cache / sessions until this runs"
+else
+    warn "the app uses ${cache_driver:-?} / ${session_driver:-?} for cache / sessions (config cache stale? run artisan optimize)"
+fi
+
+url="https://$domain"
+up=$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "$url/up" 2> /dev/null || true)
+login=$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "$url/login" 2> /dev/null || true)
+
+if [[ $up == 200 && $login =~ ^(200|302)$ ]]; then
+    ok "$url/up answers 200, /login $login"
+else
+    warn "$url/up answers $up, /login $login (shared/storage/logs/laravel.log may say why)"
+fi
+
+if [[ $session_driver == redis ]]; then
+    session_keys=$(redis_admin "$redis_data_port" "EVAL \"return #redis.call('keys', ARGV[1])\" 0 $domain:*" || true)
+
+    if [[ $session_keys =~ ^[1-9][0-9]*$ ]]; then
+        ok "$session_keys key(s) under $domain: in Redis data (sessions)"
+    else
+        warn "no keys under $domain: in Redis data after opening /login"
+    fi
+fi
+
+finish
