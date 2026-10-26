@@ -18,6 +18,9 @@ check_only=false
 open_items=0
 temp_files=()
 
+# The domain's shared/.env, for env_value; set by add-domain and use-redis.
+env_file=''
+
 trap 'rm -f "${temp_files[@]}"' EXIT
 
 say() { printf '  %-7s %s\n' "$1" "$2"; }
