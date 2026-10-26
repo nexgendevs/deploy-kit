@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+#
+# Sets up a HestiaCP user to host an app deployed with deploy-kit, or checks
+# one. Once per user (one per brand); its domains are then added with
+# add-domain. Run as root. See server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: add-user [--check] [--email <address>] <user> <owner/repo>
+
+Sets up <user> to host the app in GitHub repository <owner/repo>:
+  - creates the HestiaCP user if needed (needs --email; random password)
+  - shell bash, so deploys can log in
+  - a read-only GitHub key for the repository (~/.ssh/github_<repo>)
+  - GitHub's SSH host keys, from api.github.com
+  - the public half of the app's DEPLOY_SSH_KEY in authorized_keys, with
+    the comment github-deploy-<repo>: copied from another user that has it,
+    or pasted when asked
+
+--check  only report; change nothing
+--email  contact address for a new HestiaCP user
+
+Running it again is safe: it only adds what is missing.
+TEXT
+}
+
+user=''
+repo=''
+email=''
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        --email)
+            email=${2:-}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *)
+            if [[ -z $user ]]; then
+                user=$1
+            elif [[ -z $repo ]]; then
+                repo=$1
+            else
+                die "Too many arguments (see --help)."
+            fi
+            ;;
+    esac
+    shift
+done
+
+if [[ -z $user || -z $repo ]]; then
+    usage
+    exit 1
+fi
+
+if [[ ! $user =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    die "'$user' is not a valid user name."
+fi
+
+if [[ ! $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    die "'$repo' is not a GitHub repository (owner/name)."
+fi
+
+require_root_and_hestia
+
+repo_name=${repo#*/}
+deploy_key_comment="github-deploy-$repo_name"
+
+if $check_only; then
+    echo "Checking user $user for $repo (nothing will be changed)"
+else
+    echo "Setting up user $user for $repo"
+fi
+
+section "HestiaCP user"
+
+if user_exists "$user"; then
+    ok "user $user exists"
+elif $check_only; then
+    todo "user $user (and everything after it)"
+    finish
+else
+    if [[ -z $email ]]; then
+        die "There is no user $user. Pass --email <contact address> to create it."
+    fi
+
+    make_secret_file "$(random_password)"
+    run v-add-user "$user" "$secret_path" "$email" default
+    added "user $user (random password; set one with v-change-user-password if anyone needs to log in to HestiaCP as $user)"
+fi
+
+if [[ $(user_field "$user" SHELL) == bash ]]; then
+    ok 'shell bash'
+elif needs 'shell bash'; then
+    run v-change-user-shell "$user" bash
+    added 'shell bash'
+fi
+
+home=$(user_field "$user" HOME)
+ssh_dir="$home/.ssh"
+
+if [[ ! -d $ssh_dir ]] && needs "$ssh_dir"; then
+    run runuser -u "$user" -- mkdir -m 700 "$ssh_dir"
+    added "$ssh_dir"
+fi
+
+section "GitHub read access to $repo"
+
+# The key ssh uses for github.com, from ~/.ssh/config. A user set up by hand
+# may use another file name; that is fine as long as it works.
+read_key=''
+if grep -Eqs '^[[:space:]]*Host[[:space:]]+github\.com[[:space:]]*$' "$ssh_dir/config"; then
+    read_key=$(runuser -u "$user" -- ssh -G github.com | awk '$1 == "identityfile" && !found { print $2; found = 1 }')
+    read_key=${read_key/#\~/$home}
+
+    if [[ -f $read_key ]]; then
+        ok "read key ${read_key/#$home/\~} (in ~/.ssh/config)"
+    else
+        warn "github.com uses $read_key in ~/.ssh/config, but that file does not exist"
+    fi
+else
+    read_key="$ssh_dir/github_${repo_name//-/_}"
+
+    if [[ -f $read_key ]]; then
+        ok "read key ${read_key/#$home/\~}"
+    elif needs "read key ${read_key/#$home/\~}"; then
+        run runuser -u "$user" -- ssh-keygen -q -t ed25519 -N '' -C "$(hostname -s)-$user" -f "$read_key"
+        added "read key ${read_key/#$home/\~}"
+    fi
+
+    if needs "github.com in ~/.ssh/config"; then
+        # Starts on a new line even if the file does not end with one. The
+        # single quotes are deliberate: the user's shell expands $1 and $2.
+        # shellcheck disable=SC2016
+        run runuser -u "$user" -- bash -c 'umask 077
+            if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then echo >> "$1"; fi
+            printf "%s\n" "Host github.com" "  IdentityFile ~/.ssh/$2" "  IdentitiesOnly yes" >> "$1"' \
+            _ "$ssh_dir/config" "$(basename "$read_key")"
+        added 'github.com in ~/.ssh/config'
+    fi
+fi
+
+if runuser -u "$user" -- ssh-keygen -F github.com -f "$ssh_dir/known_hosts" > /dev/null 2>&1; then
+    ok "GitHub's host keys in ~/.ssh/known_hosts"
+elif needs "GitHub's host keys in ~/.ssh/known_hosts"; then
+    github_keys=$(curl -fsS --max-time 15 https://api.github.com/meta | jq -r '.ssh_keys[] | "github.com " + .')
+
+    if [[ -z $github_keys ]]; then
+        die "Could not read GitHub's SSH host keys from api.github.com."
+    fi
+
+    # $1 is expanded by the user's shell.
+    # shellcheck disable=SC2016
+    run runuser -u "$user" -- bash -c 'umask 077 && cat >> "$1"' _ "$ssh_dir/known_hosts" <<< "$github_keys"
+    added "GitHub's host keys in ~/.ssh/known_hosts"
+fi
+
+if [[ -f $read_key ]]; then
+    answer=$(runuser -u "$user" -- ssh -T -o BatchMode=yes -o ConnectTimeout=10 git@github.com 2>&1 < /dev/null || true)
+
+    if [[ $answer == *"Hi $repo!"* ]]; then
+        ok "$user can read $repo"
+    elif [[ $answer =~ Hi\ ([^!]+)! ]]; then
+        warn "the read key opens ${BASH_REMATCH[1]}, not $repo"
+    else
+        todo "$user cannot read $repo yet. Add its read key on GitHub:"
+        echo "          https://github.com/$repo/settings/keys/new"
+        echo "          Title \"$(hostname -s) $user (read-only)\", the key below, write access off."
+        echo '          Then run this again.'
+        echo
+        ssh-keygen -y -f "$read_key" | sed 's/^/          /'
+        echo
+    fi
+fi
+
+section 'Deploy key (DEPLOY_SSH_KEY)'
+
+authorized_keys="$ssh_dir/authorized_keys"
+
+# Lines of the given files whose comment is the deploy key's.
+deploy_key_lines() {
+    awk -v comment="$deploy_key_comment" '$NF == comment' "$@" 2> /dev/null || true
+}
+
+if [[ -n $(deploy_key_lines "$authorized_keys") ]]; then
+    ok "$deploy_key_comment in authorized_keys"
+elif needs "$deploy_key_comment in authorized_keys"; then
+    key_line=$(deploy_key_lines /home/*/.ssh/authorized_keys | head -n 1)
+    source_of_key='copied from another user'
+
+    if [[ -z $key_line && -t 0 ]]; then
+        echo "          Paste the public half of $repo's DEPLOY_SSH_KEY (one line),"
+        echo "          or press Enter to skip:"
+        read -r pasted || true
+        source_of_key='pasted'
+
+        if [[ -n $pasted ]]; then
+            key_file=$(mktemp)
+            temp_files+=("$key_file")
+            printf '%s\n' "$pasted" > "$key_file"
+
+            if [[ ! $pasted =~ ^(ssh-|ecdsa-) ]] || ! ssh-keygen -l -f "$key_file" > /dev/null 2>&1; then
+                die 'That is not an SSH public key. Nothing was added.'
+            fi
+
+            # Same key, with the comment that lets this script find it again.
+            key_line="$(awk '{ print $1, $2 }' <<< "$pasted") $deploy_key_comment"
+        fi
+    fi
+
+    if [[ -n $key_line ]]; then
+        run v-add-user-ssh-key "$user" "$key_line"
+        added "$deploy_key_comment in authorized_keys ($source_of_key)"
+    else
+        todo "$deploy_key_comment in authorized_keys: run this again and paste the public half of DEPLOY_SSH_KEY"
+    fi
+fi
+
+other_keys=$(awk -v comment="$deploy_key_comment" '$NF != comment && NF > 0 && !/^#/ { print $NF }' "$authorized_keys" 2> /dev/null | paste -sd ' ' -)
+if [[ -n $other_keys ]]; then
+    say note "authorized_keys also has: $other_keys"
+fi
+
+finish

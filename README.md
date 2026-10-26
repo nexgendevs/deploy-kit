@@ -12,6 +12,7 @@ Each deploy builds a fresh release **on the server** (git archive of the tested 
 |---|---|
 | `recipe/laravel-hestia.php` | The Deployer recipe: pre-flight checks, build, migrations behind the maintenance page when any are pending, switch, `artisan reload`, health check with rollback, cleanup |
 | `.github/workflows/deploy.yml` | The reusable deploy job: refuses a `live/*` branch whose files are not on `dev`, installs Deployer, logs in with the app's deploy key, runs `dep deploy` for the pushed branch and commit |
+| `server/` | The server checklist, and the `add-user` / `add-domain` scripts that set up (or `--check`) a HestiaCP user and domain the same way every time ([server/README.md](server/README.md)) |
 
 ## Using it in an app
 
@@ -81,6 +82,8 @@ Each deploy builds a fresh release **on the server** (git archive of the tested 
 - PHP CLI, git, Composer and Node for the SSH user; the server can read the app's repo (a read-only deploy key).
 - `<deploy_path>/shared/.env` exists before the first deploy; the deploy stops without it.
 - On HestiaCP, once per server: web and proxy templates whose document root is `…/public_html/current/public` (a custom document root resolves the symlink to one release), and PHP-FPM with `opcache.revalidate_path = 1` and `realpath_cache_ttl = 2` (otherwise OPcache keeps serving the previous release).
+
+[server/README.md](server/README.md) has the full checklist. Its `add-user` and `add-domain` scripts set up everything per user and per domain.
 
 ## Versions
 

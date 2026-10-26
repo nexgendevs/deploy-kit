@@ -1,7 +1,8 @@
 name: CI
 
 # Checks this package on every push: composer.json is valid, the recipe
-# parses and Deployer can load it. No server is contacted.
+# parses and Deployer can load it, and the server scripts pass ShellCheck.
+# No server is contacted.
 
 on:
   push:
@@ -49,3 +50,11 @@ jobs:
           PHP
           vendor/bin/dep tree deploy
           vendor/bin/dep deploy branch=dev --plan
+
+      # ShellCheck comes with GitHub's Ubuntu runners. --help runs before
+      # the scripts look for root or HestiaCP.
+      - name: Check the server scripts
+        run: |
+          shellcheck --external-sources server/lib.sh server/add-user server/add-domain
+          server/add-user --help > /dev/null
+          server/add-domain --help > /dev/null
