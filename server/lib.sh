@@ -18,8 +18,13 @@ check_only=false
 open_items=0
 temp_files=()
 
-# The domain's shared/.env, for env_value; set by add-domain and use-redis.
+# Set by the scripts that work on one domain: its site user, shared/.env, the
+# current release and its PHP binary. env_backup is set by backup_env.
+user=''
 env_file=''
+current=''
+php_bin=''
+env_backup=''
 
 trap 'rm -f "${temp_files[@]}"' EXIT
 
@@ -141,6 +146,53 @@ env_value() {
     fi
 
     printf '%s' "$value"
+}
+
+# set_env <key> <value>: sets KEY=value in $env_file as the site user ($user),
+# replacing every KEY= line, or adding one at the end (on a new line even if
+# the file does not end with one). The value goes over stdin, so it shows up
+# neither in the process list nor in this output.
+set_env() {
+    refuse_in_check_mode "set $1"
+    printf '          $ set %s in shared/.env\n' "$1"
+
+    # shellcheck disable=SC2016
+    runuser -u "$user" -- bash -c '
+        IFS= read -r value
+        if grep -q "^$2=" "$1"; then
+            sed -i "s|^$2=.*|$2=$value|" "$1"
+        else
+            if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then
+                echo >> "$1"
+            fi
+            printf "%s=%s\n" "$2" "$value" >> "$1"
+        fi' _ "$env_file" "$1" <<< "$2" || die "Could not set $1 in $env_file."
+}
+
+# backup_env: copies $env_file to .env.bak-<date> as the site user, and sets
+# $env_backup to the copy.
+backup_env() {
+    env_backup="$env_file.bak-$(date +%Y%m%d-%H%M%S)"
+    run runuser -u "$user" -- cp -p "$env_file" "$env_backup"
+}
+
+# optimize_or_restore: rebuilds the deployed release's caches after a
+# change to $env_file. If that fails, puts $env_backup back first: a failed
+# optimize has already cleared the config cache, so the site would read the
+# new .env on every request.
+optimize_or_restore() {
+    local output
+    refuse_in_check_mode 'artisan optimize'
+    printf '          $ runuser -u %s -- %s %s/artisan optimize\n' "$user" "$php_bin" "$current"
+
+    if ! output=$(runuser -u "$user" -- "$php_bin" "$current/artisan" optimize 2>&1); then
+        printf '%s\n' "$output" >&2
+        runuser -u "$user" -- cp -p "$env_backup" "$env_file"
+        runuser -u "$user" -- "$php_bin" "$current/artisan" optimize > /dev/null 2>&1 || true
+        die "artisan optimize failed with the new shared/.env (output above). The backup is back in place and the config cache rebuilt, so the site runs as before."
+    fi
+
+    printf '%s\n' "$output" | sed 's/^/          /'
 }
 
 # user_field <user> <field>: one field of v-list-user, or nothing.
