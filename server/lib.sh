@@ -126,13 +126,18 @@ user_exists() {
 # without surrounding quotes, or nothing. If the key is set twice, the last
 # line counts.
 env_value() {
-    local value
+    local value double_quoted='^"([^"]*)"' single_quoted="^'([^']*)'"
     value=$(grep -E "^$1=" "$env_file" 2> /dev/null | tail -n 1 || true)
     value=${value#*=}
     value=${value%$'\r'}
 
-    if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
+    if [[ $value =~ $double_quoted || $value =~ $single_quoted ]]; then
+        # Quoted: anything after the closing quote is a comment.
         value=${BASH_REMATCH[1]}
+    else
+        # Unquoted: a # after whitespace starts a comment, as in Laravel.
+        value=${value%%[[:space:]]#*}
+        value=${value%"${value##*[![:space:]]}"}
     fi
 
     printf '%s' "$value"
