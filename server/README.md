@@ -86,7 +86,7 @@ The whole sequence for a new domain:
 5. **`add-domain` again:** adds the scheduler's cron entry, then checks the site: `/up` answers 200, HTTP redirects to HTTPS, the HSTS header is sent, and `/.env`, `/shared/.env`, `/composer.json` and the like answer 404. The cron entry waits for the first deploy because HestiaCP emails cron output to the user's contact address, and `cd current` would fail every minute until then.
 6. **First administrator:** the app's `docs/deployment.md`.
 
-The script never changes an existing `shared/.env`. It only reports problems it finds there (`APP_DEBUG` not false, the wrong `APP_URL`, a database login that fails), and you fix them by hand.
+The script never changes an existing `shared/.env`. It only reports problems it finds there (the wrong `APP_URL`, a database login that fails, and with `--live` an `APP_ENV` other than production or `APP_DEBUG` not false), and you fix them by hand.
 
 ## Checking: `--check`
 

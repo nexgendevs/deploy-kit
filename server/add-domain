@@ -376,10 +376,11 @@ if [[ -s $env_file ]]; then
         ok "APP_ENV=$(env_value APP_ENV)"
     fi
 
-    if [[ $(env_value APP_DEBUG) =~ ^(false|0)$ ]]; then
-        ok 'APP_DEBUG=false'
+    # Like the deploy recipe: only a live site must have debug off.
+    if $live && [[ ! $(env_value APP_DEBUG) =~ ^(false|0)$ ]]; then
+        warn "APP_DEBUG is '$(env_value APP_DEBUG)'; a live site needs false"
     else
-        warn "APP_DEBUG is '$(env_value APP_DEBUG)'; it must be false on a server"
+        ok "APP_DEBUG=$(env_value APP_DEBUG)"
     fi
 fi
 
