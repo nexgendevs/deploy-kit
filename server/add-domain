@@ -16,8 +16,11 @@ Sets up <domain> under the HestiaCP user <user> (set up with add-user):
   - the web domain, with PHP-FPM <version> (default 8.4)
   - Let's Encrypt, HTTPS redirect and HSTS
   - the laravel web and proxy templates (web root current/public)
-  - shared/.env with a new APP_KEY and the database login, if missing
+  - shared/.env with a new APP_KEY, the database login and the Redis login
+    (cache and sessions in Redis), if missing
   - the database <user>_<database>, with the password from shared/.env
+  - the domain's Redis user on the shared instances (run setup-redis once
+    per server first); it may only use keys under "<domain>:"
 After the first deploy, run it again: it adds the scheduler's cron entry
 and checks the site (/up, HTTPS redirect, HSTS, no files exposed).
 
@@ -125,6 +128,10 @@ if ! grep -Eqs '^[[:space:]]*opcache\.revalidate_path[[:space:]]*=[[:space:]]*1'
     die "/etc/php/$php/fpm/conf.d/99-release-switch.ini is missing (server/README.md, server checklist)."
 fi
 
+if ! $check_only && ! redis_ready; then
+    die 'The shared Redis instances are not set up or not running. Run setup-redis first.'
+fi
+
 if $check_only; then
     echo "Checking $domain for $user (nothing will be changed)"
 else
@@ -168,21 +175,6 @@ dns_problem() {
     if [[ -n $aaaa_records ]]; then
         echo "$name has an AAAA (IPv6) record, but HestiaCP serves it over IPv4 only, so Let's Encrypt would fail"
     fi
-}
-
-# env_value <key>: the value in shared/.env without surrounding quotes, or
-# nothing.
-env_value() {
-    local value
-    value=$(grep -E "^$1=" "$env_file" 2> /dev/null | tail -n 1 || true)
-    value=${value#*=}
-    value=${value%$'\r'}
-
-    if [[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]]; then
-        value=${BASH_REMATCH[1]}
-    fi
-
-    printf '%s' "$value"
 }
 
 http_code() {
@@ -336,7 +328,18 @@ elif needs 'shared/.env'; then
             "DB_USERNAME=$db_name" \
             "DB_PASSWORD=$(random_password)" \
             '' \
-            'SESSION_SECURE_COOKIE=true'
+            'SESSION_SECURE_COOKIE=true' \
+            '' \
+            '# Cache and sessions in the shared Redis instances (server/README.md).' \
+            'CACHE_STORE=redis' \
+            'SESSION_DRIVER=redis' \
+            'REDIS_CLIENT=phpredis' \
+            'REDIS_HOST=127.0.0.1' \
+            "REDIS_PORT=$redis_data_port" \
+            "REDIS_CACHE_PORT=$redis_cache_port" \
+            "REDIS_USERNAME=$domain" \
+            "REDIS_PASSWORD=$(random_password)" \
+            "REDIS_PREFIX=$domain:"
     )
 
     run runuser -u "$user" -- mkdir -p "$deploy_path/shared"
@@ -344,7 +347,7 @@ elif needs 'shared/.env'; then
     # user's shell.
     # shellcheck disable=SC2016
     run runuser -u "$user" -- bash -c 'set -o noclobber && umask 077 && cat > "$1"' _ "$env_file" <<< "$env_content"
-    added "shared/.env (APP_ENV=$app_env, new APP_KEY, database login)"
+    added "shared/.env (APP_ENV=$app_env, new APP_KEY, database and Redis logins)"
 fi
 
 if [[ -s $env_file ]]; then
@@ -432,6 +435,46 @@ elif needs "database $db_name"; then
     run v-add-database "$user" "$db_short" "$db_short" "$secret_path" mysql
     added "$db_name, with the login from shared/.env"
     check_database_login
+fi
+
+section 'Redis'
+
+redis_username=$(env_value REDIS_USERNAME)
+
+if ! redis_ready; then
+    todo 'the shared Redis instances: run setup-redis'
+elif [[ ! -s $env_file ]]; then
+    todo "Redis user $domain (with shared/.env)"
+elif [[ -z $redis_username ]]; then
+    todo "cache and sessions in Redis: run use-redis $user $domain"
+elif [[ $redis_username != "$domain" ]]; then
+    warn "REDIS_USERNAME is '$redis_username', not $domain"
+else
+    problem=$(redis_user_problem "$domain" "$(env_value REDIS_PASSWORD)")
+
+    if [[ -z $problem ]]; then
+        ok "user $domain logs in to cache and data; own keys only"
+    elif needs "Redis user $domain ($problem)"; then
+        redis_set_user "$domain" "$(env_value REDIS_PASSWORD)"
+        problem=$(redis_user_problem "$domain" "$(env_value REDIS_PASSWORD)")
+
+        if [[ -n $problem ]]; then
+            die "$problem"
+        fi
+
+        added "Redis user $domain on cache and data; own keys only"
+    fi
+
+    redis_settings="$(env_value CACHE_STORE) $(env_value SESSION_DRIVER) $(env_value REDIS_PORT) $(env_value REDIS_CACHE_PORT) $(env_value REDIS_PREFIX)"
+    if [[ $redis_settings == "redis redis $redis_data_port $redis_cache_port $domain:" ]]; then
+        ok "CACHE_STORE=redis, SESSION_DRIVER=redis, ports $redis_data_port / $redis_cache_port, prefix $domain:"
+    else
+        warn "shared/.env does not match use-redis (run use-redis $user $domain to fix it)"
+    fi
+
+    if [[ -L $current ]] && ! grep -qs 'REDIS_CACHE_PORT' "$current/config/database.php"; then
+        warn "the deployed app ignores REDIS_CACHE_PORT: its caches land in the data instance"
+    fi
 fi
 
 section 'After the first deploy'

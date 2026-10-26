@@ -1,13 +1,15 @@
 # Server setup (HestiaCP)
 
-The one-time steps for a HestiaCP server that hosts apps deployed with deploy-kit, and two scripts that set up users and domains the same way every time:
+The one-time steps for a HestiaCP server that hosts apps deployed with deploy-kit, and the scripts that set up the server, users and domains the same way every time:
 
 | Script | Run | What it sets up |
 |---|---|---|
+| `setup-redis` | once per server | the two shared Redis instances (cache; sessions and queues) |
 | `add-user` | once per user (one per brand) | the HestiaCP user, shell, GitHub read access, the deploy key |
-| `add-domain` | once per domain, and again after its first deploy | web domain, HTTPS, templates, `shared/.env`, database, cron |
+| `add-domain` | once per domain, and again after its first deploy | web domain, HTTPS, templates, `shared/.env`, database, Redis user, cron |
+| `use-redis` | once per domain set up before Redis | moves its cache and sessions to Redis |
 
-Both run as root, only add what is missing (running them again is safe), and with `--check` only report. Like the rest of this repository, nothing here names a server, a client or a secret: those are arguments, or live in each app's `docs/deployment.md`.
+All run as root, only add what is missing (running them again is safe), and with `--check` only report. Like the rest of this repository, nothing here names a server, a client or a secret: those are arguments, or live in each app's `docs/deployment.md`.
 
 Terms: **server** = the HestiaCP host · **user** = a HestiaCP (and SSH) user, one per brand · **domain** = one installation of an app, under a user.
 
@@ -52,7 +54,16 @@ The scripts expect HestiaCP with Apache, the nginx proxy, PHP-FPM and MariaDB.
 
    To update: `git -C /opt/deploy-kit fetch --tags && git -C /opt/deploy-kit checkout <tag>`.
 
-`add-domain` refuses to run without items 6 and 7, so a missed step shows up there.
+10. **Redis**, shared by every domain: `apt install redis-server php8.4-redis` (the extension for every PHP version a site uses), then `/opt/deploy-kit/server/setup-redis`. It adds two instances next to Redis's own (which it leaves alone), both on localhost only and run by systemd's `redis-server@` template with the settings in `server/redis/`:
+
+    | Instance | Port | For | Memory | When full | On disk |
+    |---|---|---|---|---|---|
+    | `cache` | 6380 | caches | 256 MB | evicts the least recently used keys | nothing |
+    | `data` | 6381 | sessions and queues | 512 MB | refuses writes, never drops a session or job | append-only file every second, plus snapshots |
+
+    Logins are ACL users. The `default` user is off. `admin`, whose password is in `/etc/redis/admin.pass` (readable by root only), is what the scripts use. Every domain has its own user, named after the domain, that may only use keys under `<domain>:` and no dangerous commands (`FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG`…). One portal can't read another's sessions or queued mail. Because of this, `php artisan cache:clear` (which runs `FLUSHDB`) is refused; caches expire on their own. `setup-redis` also sets `vm.overcommit_memory = 1`, which Redis needs to save in the background reliably.
+
+`add-domain` refuses to run without items 6, 7 and 10, so a missed step shows up there.
 
 ## A new user: `add-user`
 
@@ -80,13 +91,29 @@ The scripts expect HestiaCP with Apache, the nginx proxy, PHP-FPM and MariaDB.
 The whole sequence for a new domain:
 
 1. **DNS:** an A record pointing at the server, and no AAAA record (HestiaCP serves the domain over IPv4 only). HestiaCP adds `www.<domain>` as an alias to a two-part domain (`example.com`), so `www` needs a record too, or remove the alias. The script checks with a public resolver and stops before Let's Encrypt if anything is missing.
-2. **`add-domain`:** web domain with the PHP-FPM backend, Let's Encrypt, HTTPS redirect and HSTS, no custom document root, both `laravel` templates (checked in the generated Apache and nginx files), `shared/.env`, then the database with the password from `shared/.env`. The new `.env` has only what every app needs: `APP_ENV`, a new `APP_KEY`, `APP_DEBUG=false`, `APP_URL`, `LOG_LEVEL`, the database login and `SESSION_SECURE_COOKIE=true`.
+2. **`add-domain`:** web domain with the PHP-FPM backend, Let's Encrypt, HTTPS redirect and HSTS, no custom document root, both `laravel` templates (checked in the generated Apache and nginx files), `shared/.env`, then the database and the domain's Redis user with the passwords from `shared/.env`. The new `.env` has only what every app needs: `APP_ENV`, a new `APP_KEY`, `APP_DEBUG=false`, `APP_URL`, `LOG_LEVEL`, the database login, `SESSION_SECURE_COOKIE=true`, and cache and sessions in Redis (`CACHE_STORE`, `SESSION_DRIVER`, the `REDIS_*` login, the ports and the prefix `<domain>:`). The app's `config/database.php` must read `REDIS_CACHE_PORT` for its `cache` connection, so caches go to the cache instance.
 3. **The app's own settings:** add them to `shared/.env` as the user, before the first deploy. The app's `docs/deployment.md` lists them (`APP_NAME`, queue, mail…).
 4. **Deploy:** add the site to the app's `deploy.php` and deploy.
 5. **`add-domain` again:** adds the scheduler's cron entry, then checks the site: `/up` answers 200, HTTP redirects to HTTPS, the HSTS header is sent, and `/.env`, `/shared/.env`, `/composer.json` and the like answer 404. The cron entry waits for the first deploy because HestiaCP emails cron output to the user's contact address, and `cd current` would fail every minute until then.
 6. **First administrator:** the app's `docs/deployment.md`.
 
 The script never changes an existing `shared/.env`. It only reports problems it finds there (the wrong `APP_URL`, a database login that fails, and with `--live` an `APP_ENV` other than production or `APP_DEBUG` not false), and you fix them by hand.
+
+## An existing domain to Redis: `use-redis`
+
+Domains set up before Redis keep their cache and sessions in the database until this runs, once per domain (`add-domain --check` reports them):
+
+```bash
+/opt/deploy-kit/server/use-redis <user> <domain>
+```
+
+First the app's `config/database.php` must read `REDIS_CACHE_PORT` for its `cache` connection, and that change must be deployed; the script stops before changing anything if it isn't. Then the script:
+
+1. creates the domain's Redis user on both instances;
+2. backs up `shared/.env` as `.env.bak-<date>`, then sets `CACHE_STORE=redis`, `SESSION_DRIVER=redis` and the `REDIS_*` login, ports and prefix in it. The values never appear in its output;
+3. rebuilds the config cache (`artisan optimize`) and checks that the app now uses Redis, that `/up` and `/login` answer, and that sessions arrive in Redis.
+
+Everybody signed in to the domain is signed out once: sessions don't move. Queues stay as they are and move to Redis together with Horizon.
 
 ## Checking: `--check`
 
@@ -115,4 +142,5 @@ Each line is `ok`, `added`, `todo` (missing, and the script can add it), `warn` 
 - Read key: `~/.ssh/github_<repo>` (dashes become underscores), selected for `github.com` in `~/.ssh/config`. One per user, added on GitHub as a read-only deploy key titled `<server> <user> (read-only)`.
 - Deploy key: one per app (the `DEPLOY_SSH_KEY` secret). Its public half is in every user that hosts the app, with the one-word comment `github-deploy-<repo>`. HestiaCP splits comments at spaces, and `add-user` uses the comment to find the key.
 - Database: `<user>_<name>`, with a login of the same name.
+- Redis: one ACL user per domain, named after the domain, on both instances with the same password (`REDIS_USERNAME` / `REDIS_PASSWORD`), limited to keys under `REDIS_PREFIX=<domain>:`. A Horizon prefix must start with it too (`<domain>:horizon:`).
 - `shared/.env`: mode 600, owned by the user, written once. Deploys and these scripts never change it.
