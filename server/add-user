@@ -124,7 +124,7 @@ if grep -Eqs '^[[:space:]]*Host[[:space:]]+github\.com[[:space:]]*$' "$ssh_dir/c
     if [[ -f $read_key ]]; then
         ok "read key ${read_key/#$home/\~} (in ~/.ssh/config)"
     else
-        warn "~/.ssh/config uses $read_key for github.com, but that file does not exist"
+        warn "github.com uses $read_key in ~/.ssh/config, but that file does not exist"
     fi
 else
     read_key="$ssh_dir/github_${repo_name//-/_}"
@@ -137,7 +137,9 @@ else
     fi
 
     if needs "github.com in ~/.ssh/config"; then
-        # Starts on a new line even if the file does not end with one.
+        # Starts on a new line even if the file does not end with one. The
+        # single quotes are deliberate: the user's shell expands $1 and $2.
+        # shellcheck disable=SC2016
         run runuser -u "$user" -- bash -c 'umask 077
             if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then echo >> "$1"; fi
             printf "%s\n" "Host github.com" "  IdentityFile ~/.ssh/$2" "  IdentitiesOnly yes" >> "$1"' \
@@ -155,6 +157,8 @@ elif needs "GitHub's host keys in ~/.ssh/known_hosts"; then
         die "Could not read GitHub's SSH host keys from api.github.com."
     fi
 
+    # $1 is expanded by the user's shell.
+    # shellcheck disable=SC2016
     run runuser -u "$user" -- bash -c 'umask 077 && cat >> "$1"' _ "$ssh_dir/known_hosts" <<< "$github_keys"
     added "GitHub's host keys in ~/.ssh/known_hosts"
 fi

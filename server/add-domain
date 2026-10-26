@@ -340,6 +340,9 @@ elif needs 'shared/.env'; then
     )
 
     run runuser -u "$user" -- mkdir -p "$deploy_path/shared"
+    # Written as the user, never over an existing file. $1 is expanded by the
+    # user's shell.
+    # shellcheck disable=SC2016
     run runuser -u "$user" -- bash -c 'set -o noclobber && umask 077 && cat > "$1"' _ "$env_file" <<< "$env_content"
     added "shared/.env (APP_ENV=$app_env, new APP_KEY, database login)"
 fi
