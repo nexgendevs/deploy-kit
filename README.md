@@ -12,7 +12,7 @@ Each deploy builds a fresh release **on the server** (git archive of the tested 
 |---|---|
 | `recipe/laravel-hestia.php` | The Deployer recipe: pre-flight checks, build, migrations behind the maintenance page when any are pending, switch, `artisan reload`, health check with rollback, cleanup |
 | `.github/workflows/deploy.yml` | The reusable deploy job: refuses a `live/*` branch whose files are not on `dev`, installs Deployer, logs in with the app's deploy key, runs `dep deploy` for the pushed branch and commit |
-| `server/` | The server checklist, and the scripts that set up (or `--check`) the shared Redis instances, a HestiaCP user and a domain the same way every time: `setup-redis`, `add-user`, `add-domain`, `use-redis`, `use-horizon` ([server/README.md](server/README.md)) |
+| `server/` | The server checklist, and the scripts that set up (or `--check`) the shared Redis instances and Reverb server, a HestiaCP user and a domain the same way every time: `setup-redis`, `add-user`, `add-domain`, `use-redis`, `use-horizon`, `setup-reverb`, `use-reverb` ([server/README.md](server/README.md)) |
 
 ## Using it in an app
 

@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+#
+# Gives a domain its own app on the shared Reverb server, so its app can
+# broadcast, or checks it. Once per domain, as root, after setup-reverb and
+# once the app's broadcasting change is deployed. See server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: use-reverb [--check] [--php <version>] <user> <domain>
+
+Gives <domain> its own app on the shared Reverb server (setup-reverb):
+  - creates the app: a new app id, key and secret, accepting WebSocket
+    connections from https://<domain> only, as <domain>.json in Reverb's
+    apps folder. Reverb restarts to load it, so every connected browser, on
+    every domain, reconnects once
+  - backs up shared/.env, then sets BROADCAST_CONNECTION=reverb, the app's
+    REVERB_APP_ID, REVERB_APP_KEY and REVERB_APP_SECRET, REVERB_HOST, _PORT
+    and _SCHEME (the app publishes to Reverb on localhost) and VITE_REVERB_*
+    (browsers connect to wss://<Reverb's domain>), and rebuilds the config
+    cache (artisan optimize)
+  - checks Reverb accepts the app's signed requests, the app can publish an
+    event, and a browser on <domain> can connect
+VITE_* values are built into the app's JavaScript, so browsers get the key
+with the next deploy; until then this reports the build has none.
+
+--check  only report; change nothing
+--php    PHP version, as in the app's deploy.php (default 8.4)
+
+Running it again is safe: it only changes what is missing. A domain with
+REVERB_APP_* in shared/.env keeps its app id, key and secret.
+TEXT
+}
+
+php=8.4
+args=()
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        --php)
+            php=${2:-}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#args[@]} != 2)); then
+    usage
+    exit 1
+fi
+
+user=${args[0]}
+domain=${args[1]}
+
+if [[ ! $user =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    die "'$user' is not a valid user name."
+fi
+
+if [[ ! $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    die "'$domain' is not a domain name (lower case, no scheme or path)."
+fi
+
+if [[ ! $php =~ ^[0-9]+\.[0-9]+$ ]]; then
+    die "'$php' is not a PHP version (for example 8.4)."
+fi
+
+require_root_and_hestia
+
+if ! command -v supervisorctl > /dev/null; then
+    die 'Supervisor is not installed: apt install supervisor'
+fi
+
+if [[ ! -s $reverb_conf ]]; then
+    die "There is no shared Reverb server yet ($reverb_conf is missing). Run setup-reverb first."
+fi
+
+reverb_user=$(reverb_setting user)
+reverb_domain=$(reverb_setting domain)
+reverb_port=$(reverb_setting port)
+reverb_php=$(reverb_setting php)
+apps_dir=$(reverb_setting apps)
+
+if [[ -z $reverb_user || -z $reverb_domain || -z $reverb_port || -z $reverb_php || -z $apps_dir ]]; then
+    die "$reverb_conf is incomplete. Run setup-reverb again."
+fi
+
+if [[ $domain == "$reverb_domain" ]]; then
+    die "$domain runs the Reverb server itself; use-reverb is for the domains that broadcast through it."
+fi
+
+if [[ ! -d $apps_dir ]]; then
+    die "Reverb's apps folder $apps_dir is missing. Run setup-reverb again."
+fi
+
+reverb_current="$(user_field "$reverb_user" HOME)/web/$reverb_domain/public_html/current"
+reverb_program="$reverb_domain-reverb"
+
+if ! user_exists "$user"; then
+    die "There is no HestiaCP user $user."
+fi
+
+home=$(user_field "$user" HOME)
+env_file="$home/web/$domain/public_html/shared/.env"
+current="$home/web/$domain/public_html/current"
+php_bin="/usr/bin/php$php"
+app_file="$apps_dir/$domain.json"
+
+if [[ -L $env_file || ! -s $env_file ]]; then
+    die "$env_file is missing (or a symbolic link). Set the domain up with add-domain first."
+fi
+
+if [[ ! -L $current ]]; then
+    die "$domain is not deployed yet. Deploy the app first."
+fi
+
+if [[ ! -d $current/vendor/pusher/pusher-php-server ]]; then
+    die "The deployed app has no pusher/pusher-php-server, which Laravel's reverb broadcaster needs. Deploy the app's broadcasting change first; nothing was changed."
+fi
+
+if $check_only; then
+    echo "Checking $domain's Reverb app (nothing will be changed)"
+else
+    echo "Giving $domain its own app on the shared Reverb server ($reverb_domain)"
+fi
+
+section 'Reverb app'
+
+app_id=$(env_value REVERB_APP_ID)
+app_key=$(env_value REVERB_APP_KEY)
+app_secret=$(env_value REVERB_APP_SECRET)
+new_app=false
+
+if [[ -z $app_id || -z $app_key || -z $app_secret ]]; then
+    used_ids=$(jq -r '.app_id // empty' "$apps_dir"/*.json 2> /dev/null || true)
+
+    app_id=$(shuf -i 100000-999999 -n 1)
+    while grep -qx "$app_id" <<< "$used_ids"; do
+        app_id=$(shuf -i 100000-999999 -n 1)
+    done
+
+    app_key=$(random_token 20)
+    app_secret=$(random_token 20)
+    new_app=true
+fi
+
+# Built from stdin, so the secret shows up neither in the process list nor
+# in this output.
+app_json=$(printf '%s\n' "$app_id" "$app_key" "$app_secret" "$domain" \
+    | jq -R -s -c 'split("\n") | {app_id: .[0], key: .[1], secret: .[2], allowed_origins: [.[3]]}')
+
+app_matches=false
+if [[ -f $app_file ]] && [[ $(jq -S -c . "$app_file" 2> /dev/null || true) == "$(jq -S -c . <<< "$app_json")" ]]; then
+    app_matches=true
+fi
+
+reverb_reload=false
+which_app="app $app_id, from shared/.env"
+if $new_app; then
+    which_app='a new app'
+fi
+
+if $app_matches; then
+    ok "$domain.json: app $app_id, connections from https://$domain only"
+elif needs "$domain.json in Reverb's apps folder ($which_app)"; then
+    app_temp=$(mktemp /tmp/deploy-kit.XXXXXXXX)
+    temp_files+=("$app_temp")
+    printf '%s\n' "$app_json" > "$app_temp"
+    run install -o "$reverb_user" -g "$reverb_user" -m 600 "$app_temp" "$app_file"
+    reverb_reload=true
+    added "$domain.json: app $app_id, connections from https://$domain only"
+fi
+
+# Reverb loads only the first of two files with the same app id or key.
+for other in "$apps_dir"/*.json; do
+    if [[ -f $other && $other != "$app_file" ]] \
+        && jq -e --arg id "$app_id" --arg key "$app_key" '.app_id == $id or .key == $key' "$other" > /dev/null 2>&1; then
+        warn "$(basename "$other") has the same app id or key; Reverb serves only one of them"
+    fi
+done
+
+section 'shared/.env'
+
+keys=(BROADCAST_CONNECTION REVERB_APP_ID REVERB_APP_KEY REVERB_APP_SECRET REVERB_HOST REVERB_PORT REVERB_SCHEME
+    VITE_REVERB_APP_KEY VITE_REVERB_HOST VITE_REVERB_PORT VITE_REVERB_SCHEME)
+values=(reverb "$app_id" "$app_key" "$app_secret" 127.0.0.1 "$reverb_port" http
+    "$app_key" "$reverb_domain" 443 https)
+changes=()
+
+for i in "${!keys[@]}"; do
+    if [[ $(env_value "${keys[i]}") != "${values[i]}" ]]; then
+        changes+=("$i")
+    fi
+done
+
+env_changed=false
+
+if ((${#changes[@]} == 0)); then
+    ok "BROADCAST_CONNECTION=reverb, REVERB_* (publish on 127.0.0.1:$reverb_port), VITE_REVERB_* (wss://$reverb_domain)"
+else
+    names=$(for i in "${changes[@]}"; do printf '%s ' "${keys[i]}"; done)
+
+    if needs "set ${names% } in shared/.env"; then
+        backup_env
+
+        for i in "${changes[@]}"; do
+            set_env "${keys[i]}" "${values[i]}"
+        done
+
+        env_changed=true
+        added "${names% } (backup: shared/$(basename "$env_backup"))"
+    fi
+fi
+
+if grep -qs '^PUSHER_APP_KEY=' "$env_file"; then
+    say note 'the PUSHER_* and VITE_PUSHER_* lines in shared/.env are not used with Reverb; they can go'
+fi
+
+section 'Reverb'
+
+if $reverb_reload; then
+    # Reverb reads its apps from the config cache when it starts.
+    run runuser -u "$reverb_user" -- "/usr/bin/php$reverb_php" "$reverb_current/artisan" optimize
+    run supervisorctl restart "$reverb_program"
+fi
+
+status=$(program_status "$reverb_program")
+
+if [[ $status == *RUNNING* ]]; then
+    ok "Supervisor runs $reverb_program"
+else
+    warn "Supervisor does not run $reverb_program (${status:-not loaded}; setup-reverb --check says more)"
+fi
+
+section 'Site'
+
+pending=false
+if $check_only && ! { $app_matches && ((${#changes[@]} == 0)); }; then
+    pending=true
+fi
+
+if $pending; then
+    later 'the app, Reverb and browser checks: once this runs'
+    finish
+fi
+
+if $env_changed; then
+    optimize_or_restore
+fi
+
+drivers=$(runuser -u "$user" -- "$php_bin" "$current/artisan" about --only=drivers --json 2> /dev/null || true)
+broadcaster=$(jq -r '.drivers.broadcasting // ""' <<< "$drivers" 2> /dev/null || true)
+
+if [[ $broadcaster == reverb ]]; then
+    ok 'the app broadcasts with reverb'
+else
+    warn "the app broadcasts with ${broadcaster:-?} (config cache stale? run artisan optimize)"
+fi
+
+# Reverb needs a moment after a restart before it answers.
+for _ in 1 2 3 4 5 6; do
+    reply=$(reverb_api "$reverb_port" "$app_id" "$app_key" "$app_secret" /channels)
+    reply_status=${reply##*$'\n'}
+    if [[ $reply_status == 200 ]] || ! $reverb_reload; then
+        break
+    fi
+    sleep 1
+done
+
+if [[ $reply_status == 200 ]]; then
+    ok "Reverb accepts the app's signed requests (key and secret from shared/.env)"
+else
+    warn "Reverb answers $reply_status to the app's signed request: $(head -c 200 <<< "${reply%$'\n'*}")"
+fi
+
+# The app's own broadcaster, with its cached config, sends one event to a
+# channel nobody listens on.
+# shellcheck disable=SC2016
+publish='require "vendor/autoload.php";
+$app = require "bootstrap/app.php";
+$app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
+$app->make(Illuminate\Contracts\Broadcasting\Factory::class)->connection("reverb")
+    ->broadcast(["deploy-kit-check"], "deploy-kit.check", []);
+echo "sent";'
+
+published=$(cd "$current" && runuser -u "$user" -- "$php_bin" -r "$publish" 2>&1 || true)
+
+if [[ $published == *sent ]]; then
+    ok 'the app publishes events to Reverb'
+else
+    warn "the app could not publish an event to Reverb: $(head -n 3 <<< "$published" | tr -s ' \n' ' ')"
+fi
+
+event=$(reverb_first_event "https://$reverb_domain/app/$app_key" "$domain")
+
+if [[ $event == pusher:connection_established ]]; then
+    ok "browsers on https://$domain connect to wss://$reverb_domain"
+else
+    warn "a browser on https://$domain gets ${event:-no answer} from wss://$reverb_domain (allowed origin? nginx?)"
+fi
+
+if grep -rqsF "$app_key" "$current/public/build/assets"; then
+    ok 'the deployed JavaScript has the Reverb key'
+else
+    warn "the deployed JavaScript has no Reverb key yet: deploy $domain again (VITE_REVERB_* are built in)"
+fi
+
+finish

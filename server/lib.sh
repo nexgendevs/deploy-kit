@@ -298,3 +298,78 @@ redis_set_user() {
         fi
     done
 }
+
+# --- Supervisor (use-horizon, setup-reverb, use-reverb) ----------------------
+
+# program_status <program>: Supervisor's status line for the program, once it
+# is no longer STARTING (it is for a second or so after a start), or nothing
+# when Supervisor has not loaded it. Does not wait in --check mode.
+program_status() {
+    local status=''
+
+    for _ in 1 2 3 4 5; do
+        status=$(supervisorctl status "$1" 2> /dev/null || true)
+        if [[ $status != *STARTING* ]] || $check_only; then
+            break
+        fi
+        sleep 1
+    done
+
+    printf '%s' "$status"
+}
+
+# --- Reverb (setup-reverb, use-reverb, add-domain) ---------------------------
+#
+# One shared Reverb server, run from one domain whose app has laravel/reverb
+# (setup-reverb), with one Reverb app per domain that broadcasts (use-reverb).
+# Reverb listens on localhost only: browsers reach it through nginx (wss on
+# 443 at /app/ on the Reverb domain), and the apps on this server publish to
+# it directly. setup-reverb records where it runs in $reverb_conf.
+
+reverb_conf=/etc/deploy-kit/reverb.conf
+
+# reverb_setting <name>: user, domain, port, php or apps from $reverb_conf,
+# or nothing.
+reverb_setting() {
+    sed -n "s/^$1=//p" "$reverb_conf" 2> /dev/null | tail -n 1
+}
+
+# random_token <length>: lower-case letters and digits, like Reverb's own
+# app keys and secrets.
+random_token() {
+    local characters
+    characters=$(openssl rand -base64 96 | tr -dc 'a-z0-9')
+    printf '%s' "${characters:0:$1}"
+}
+
+# reverb_api <port> <app id> <key> <secret> <path>: a GET request to Reverb's
+# HTTP API on localhost, signed with the app's secret as the app's
+# broadcaster signs them (Pusher protocol). Prints the reply's body, then its
+# status code on a line of its own (000 when nothing answers). The secret
+# goes to PHP ($php_bin) over stdin, so it shows up neither in the process
+# list nor in this output.
+reverb_api() {
+    local port=$1 key=$3 secret=$4 path="/apps/$2$5" query signature
+    query="auth_key=$key&auth_timestamp=$(date +%s)&auth_version=1.0"
+
+    # shellcheck disable=SC2016
+    signature=$({ printf '%s\n' "$secret"; printf 'GET\n%s\n%s' "$path" "$query"; } \
+        | "$php_bin" -r '$secret = rtrim(fgets(STDIN), "\n"); echo hash_hmac("sha256", stream_get_contents(STDIN), $secret);')
+
+    curl -sS --max-time 10 -w '\n%{http_code}' "http://127.0.0.1:$port$path?$query&auth_signature=$signature" 2> /dev/null || true
+}
+
+# reverb_first_event <url> <domain>: opens a WebSocket connection to <url>
+# (https://<Reverb domain>/app/<key>) the way a browser on https://<domain>
+# would, and prints the first event Reverb sends: pusher:connection_established
+# when it accepts the key and the origin, pusher:error when it refuses them,
+# nothing when nothing answers. Takes 3 seconds.
+reverb_first_event() {
+    local frames
+    frames=$(curl -sS -N --http1.1 --max-time 3 \
+        -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
+        -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" -H "Origin: https://$2" \
+        "$1?protocol=7&client=deploy-kit&version=1.0&flash=false" 2> /dev/null | tr -d '\0' || true)
+
+    grep -ao '"event":"[^"]*"' <<< "$frames" | head -n 1 | cut -d '"' -f 4 || true
+}

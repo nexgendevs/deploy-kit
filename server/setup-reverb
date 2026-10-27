@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+#
+# Runs the shared Reverb server from one domain, or checks it. Once per
+# server, as root, after add-domain has set the domain up and its app (with
+# laravel/reverb) is deployed. Domains that broadcast then get their own
+# Reverb app from use-reverb. See server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: setup-reverb [--check] [--port <port>] [--php <version>] <user> <domain>
+
+Runs the shared Reverb server from <domain>, whose app has laravel/reverb
+and reads its apps from REVERB_APPS_PATH (one JSON file per domain):
+  - the apps folder shared/reverb-apps, readable by <user> only
+  - backs up shared/.env, then sets REVERB_SERVER_HOST=127.0.0.1,
+    REVERB_SERVER_PORT and REVERB_APPS_PATH, and rebuilds the config cache
+    (artisan optimize)
+  - writes the Supervisor program /etc/supervisor/conf.d/<domain>-reverb.conf:
+    "php artisan reverb:start" on 127.0.0.1:<port>, from current/ as <user>,
+    restarted whenever it exits (every deploy ends it with reverb:restart);
+    log in /var/log/supervisor/<domain>-reverb.log
+  - adds nginx.ssl.conf_reverb to the domain's HestiaCP web configuration:
+    WebSocket connections to https://<domain>/app/ go to Reverb. Reverb's
+    HTTP API stays on localhost, and the rest of the site is unchanged
+  - records the server in /etc/deploy-kit/reverb.conf, for use-reverb
+  - checks Reverb answers on localhost and through nginx
+Open files stay at Supervisor's 1024: Reverb's default event loop
+(stream_select) cannot use more. server/README.md says when to change that.
+
+--check  only report; change nothing
+--port   Reverb's port on localhost (default 8090; HestiaCP's Apache has 8080)
+--php    PHP version, as in the app's deploy.php (default 8.4)
+
+Running it again is safe: it only changes what is missing.
+TEXT
+}
+
+port=8090
+php=8.4
+args=()
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        --port)
+            port=${2:-}
+            shift
+            ;;
+        --php)
+            php=${2:-}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#args[@]} != 2)); then
+    usage
+    exit 1
+fi
+
+user=${args[0]}
+domain=${args[1]}
+
+if [[ ! $user =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    die "'$user' is not a valid user name."
+fi
+
+if [[ ! $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    die "'$domain' is not a domain name (lower case, no scheme or path)."
+fi
+
+if [[ ! $port =~ ^[0-9]+$ ]] || ((port < 1024 || port > 65535)); then
+    die "'$port' is not a port between 1024 and 65535."
+fi
+
+if [[ ! $php =~ ^[0-9]+\.[0-9]+$ ]]; then
+    die "'$php' is not a PHP version (for example 8.4)."
+fi
+
+require_root_and_hestia
+
+for tool in supervisorctl nginx ss; do
+    if ! command -v "$tool" > /dev/null; then
+        die "$tool is not installed (server/README.md, server checklist)."
+    fi
+done
+
+if ! user_exists "$user"; then
+    die "There is no HestiaCP user $user."
+fi
+
+home=$(user_field "$user" HOME)
+deploy_path="$home/web/$domain/public_html"
+env_file="$deploy_path/shared/.env"
+current="$deploy_path/current"
+php_bin="/usr/bin/php$php"
+apps_dir="$deploy_path/shared/reverb-apps"
+program="$domain-reverb"
+program_file="/etc/supervisor/conf.d/$program.conf"
+log_file="/var/log/supervisor/$program.log"
+nginx_file="$home/conf/web/$domain/nginx.ssl.conf_reverb"
+
+if [[ -L $env_file || ! -s $env_file ]]; then
+    die "$env_file is missing (or a symbolic link). Set the domain up with add-domain first."
+fi
+
+if [[ ! -L $current ]]; then
+    die "$domain is not deployed yet. Deploy the app first."
+fi
+
+if [[ ! -d $current/vendor/laravel/reverb ]]; then
+    die "The deployed app has no laravel/reverb. Deploy the Reverb server app first; nothing was changed."
+fi
+
+recorded=$(reverb_setting domain)
+if [[ -n $recorded && $recorded != "$domain" ]]; then
+    die "This server's Reverb already runs from $recorded ($reverb_conf). Nothing was changed."
+fi
+
+# The include line comes from the domain's proxy template (laravel has it).
+if ! grep -qsF 'nginx.ssl.conf_*' "$home/conf/web/$domain/nginx.ssl.conf"; then
+    die "$domain's nginx configuration does not include nginx.ssl.conf_* files. Set it up with add-domain (laravel proxy template) first."
+fi
+
+# Something else on the port would take Reverb's connections, or keep it
+# from starting.
+listeners=$(ss -ltnH "sport = :$port" 2> /dev/null || true)
+if [[ -n $listeners && $(supervisorctl status "$program" 2> /dev/null || true) != *RUNNING* ]]; then
+    die "Port $port is already in use: $(awk '{ print $4, $6 }' <<< "$listeners" | paste -sd ' ' -). Choose another with --port; nothing was changed."
+fi
+
+if $check_only; then
+    echo "Checking the shared Reverb server on $domain (nothing will be changed)"
+else
+    echo "Setting up the shared Reverb server on $domain"
+fi
+
+section 'Apps'
+
+if [[ -d $apps_dir && ! -L $apps_dir && $(stat -c '%U %a' "$apps_dir") == "$user 700" ]]; then
+    ok "shared/reverb-apps, readable by $user only"
+elif needs "shared/reverb-apps, readable by $user only"; then
+    run install -d -o "$user" -g "$user" -m 700 "$apps_dir"
+    added "shared/reverb-apps, readable by $user only"
+fi
+
+apps=$(find "$apps_dir" -maxdepth 1 -name '*.json' -printf '%f\n' 2> /dev/null | sed 's/\.json$//' | sort | paste -sd ' ' - || true)
+say note "apps: ${apps:-none yet (use-reverb adds one per domain)}"
+
+section 'shared/.env'
+
+keys=(REVERB_SERVER_HOST REVERB_SERVER_PORT REVERB_APPS_PATH)
+values=(127.0.0.1 "$port" "$apps_dir")
+changes=()
+
+for i in "${!keys[@]}"; do
+    if [[ $(env_value "${keys[i]}") != "${values[i]}" ]]; then
+        changes+=("$i")
+    fi
+done
+
+env_changed=false
+
+if ((${#changes[@]} == 0)); then
+    ok "REVERB_SERVER_HOST=127.0.0.1, REVERB_SERVER_PORT=$port, REVERB_APPS_PATH"
+else
+    names=$(for i in "${changes[@]}"; do printf '%s ' "${keys[i]}"; done)
+
+    if needs "set ${names% } in shared/.env"; then
+        backup_env
+
+        for i in "${changes[@]}"; do
+            set_env "${keys[i]}" "${values[i]}"
+        done
+
+        optimize_or_restore
+        env_changed=true
+        added "${names% } (backup: shared/$(basename "$env_backup"))"
+    fi
+fi
+
+section 'Supervisor'
+
+program_conf=$(
+    printf '%s\n' \
+        "; deploy-kit (setup-reverb): the shared Reverb server on $domain. Rewritten by setup-reverb." \
+        "[program:$program]" \
+        "command=$php_bin $current/artisan reverb:start --host=127.0.0.1 --port=$port" \
+        "user=$user" \
+        "directory=$deploy_path" \
+        'autostart=true' \
+        'autorestart=true' \
+        'stopasgroup=true' \
+        'killasgroup=true' \
+        '; Reverb closes its connections and stops on SIGTERM.' \
+        'stopwaitsecs=15' \
+        'redirect_stderr=true' \
+        "stdout_logfile=$log_file" \
+        'stdout_logfile_maxbytes=10MB' \
+        'stdout_logfile_backups=3'
+)
+
+program_changed=false
+
+if [[ -f $program_file && $(< "$program_file") == "$program_conf" ]]; then
+    ok "$program_file"
+elif needs "$program_file"; then
+    refuse_in_check_mode 'Supervisor program'
+    printf '%s\n' "$program_conf" > "$program_file"
+    run supervisorctl reread
+    run supervisorctl update "$program"
+    program_changed=true
+    added "$program_file (loaded)"
+fi
+
+status=$(program_status "$program")
+
+# A running Reverb read its settings when it started.
+if $env_changed && ! $program_changed && [[ $status == *RUNNING* ]]; then
+    run supervisorctl restart "$program"
+    status=$(program_status "$program")
+fi
+
+if [[ $status == *RUNNING* ]]; then
+    ok "Supervisor runs $program"
+elif needs "Supervisor runs $program (now: ${status:-not loaded})"; then
+    run supervisorctl start "$program"
+    added "Supervisor runs $program"
+fi
+
+section 'nginx'
+
+nginx_conf=$(
+    printf '%s\n' \
+        "# deploy-kit (setup-reverb): WebSocket connections at /app/ go to the shared" \
+        "# Reverb server on 127.0.0.1:$port. Its HTTP API (/apps/) is not proxied:" \
+        '# the apps publish on localhost. Rewritten by setup-reverb.' \
+        'location ^~ /app/ {' \
+        "    proxy_pass http://127.0.0.1:$port;" \
+        '    proxy_http_version 1.1;' \
+        '    proxy_set_header Host $host;' \
+        '    proxy_set_header X-Real-IP $remote_addr;' \
+        '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;' \
+        '    proxy_set_header X-Forwarded-Proto $scheme;' \
+        '    proxy_set_header Upgrade $http_upgrade;' \
+        '    proxy_set_header Connection "upgrade";' \
+        '    # Reverb pings every connection at least once a minute.' \
+        '    proxy_read_timeout 120s;' \
+        '    proxy_send_timeout 120s;' \
+        '}'
+)
+
+if [[ -f $nginx_file && $(< "$nginx_file") == "$nginx_conf" ]]; then
+    ok "${nginx_file/#$home/\~}"
+elif needs "${nginx_file/#$home/\~}"; then
+    refuse_in_check_mode 'nginx configuration'
+    previous=''
+    if [[ -f $nginx_file ]]; then
+        previous=$(< "$nginx_file")
+    fi
+
+    printf '          $ write %s\n' "$nginx_file"
+    printf '%s\n' "$nginx_conf" > "$nginx_file"
+    chmod 644 "$nginx_file"
+
+    # A file nginx refuses would also stop HestiaCP's next reload.
+    if ! output=$(nginx -t 2>&1); then
+        printf '%s\n' "$output" >&2
+        if [[ -n $previous ]]; then
+            printf '%s\n' "$previous" > "$nginx_file"
+        else
+            rm -f "$nginx_file"
+        fi
+        die "nginx refused the new configuration (output above). The previous state is back."
+    fi
+
+    run systemctl reload nginx
+    added "${nginx_file/#$home/\~} (nginx reloaded)"
+fi
+
+section "$reverb_conf"
+
+recorded_conf=$(
+    printf '%s\n' \
+        '# deploy-kit (setup-reverb): where the shared Reverb server runs; use-reverb' \
+        '# reads it. Rewritten by setup-reverb.' \
+        "user=$user" \
+        "domain=$domain" \
+        "port=$port" \
+        "php=$php" \
+        "apps=$apps_dir"
+)
+
+if [[ -f $reverb_conf && $(< "$reverb_conf") == "$recorded_conf" ]]; then
+    ok "$reverb_conf"
+elif needs "$reverb_conf"; then
+    run install -d -m 755 "$(dirname "$reverb_conf")"
+    refuse_in_check_mode 'reverb.conf'
+    printf '%s\n' "$recorded_conf" > "$reverb_conf"
+    chmod 644 "$reverb_conf"
+    added "$reverb_conf"
+fi
+
+section 'Checks'
+
+# Reverb needs a moment after a start before it answers.
+for _ in 1 2 3 4 5; do
+    local_up=$(curl -sS -o /dev/null --max-time 5 -w '%{http_code}' "http://127.0.0.1:$port/up" 2> /dev/null || true)
+    if [[ $local_up == 200 ]] || $check_only; then
+        break
+    fi
+    sleep 1
+done
+
+if [[ $local_up == 200 ]]; then
+    ok "Reverb answers on 127.0.0.1:$port (/up)"
+else
+    warn "Reverb does not answer on 127.0.0.1:$port (/up: $local_up; log: $log_file)"
+fi
+
+# A key Reverb does not know: it answers the connection with pusher:error,
+# which shows the connection got through nginx to Reverb.
+event=$(reverb_first_event "https://$domain/app/deploy-kit-check" "$domain")
+if [[ $event == pusher:* ]]; then
+    ok "WebSocket connections to https://$domain/app/ reach Reverb"
+else
+    warn "no WebSocket answer from https://$domain/app/ (nginx: ${nginx_file/#$home/\~})"
+fi
+
+site_up=$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "https://$domain/up" 2> /dev/null || true)
+api=$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "https://$domain/apps/deploy-kit-check/channels" 2> /dev/null || true)
+
+if [[ $site_up == 200 ]]; then
+    ok "https://$domain/up answers 200 (the app; deploys check it)"
+else
+    warn "https://$domain/up answers $site_up (shared/storage/logs/laravel.log may say why)"
+fi
+
+if [[ $api == 404 ]]; then
+    ok "Reverb's HTTP API is not reachable from outside (/apps/ answers 404)"
+else
+    warn "https://$domain/apps/ answers $api; Reverb's HTTP API should stay on localhost"
+fi
+
+finish

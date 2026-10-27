@@ -166,13 +166,7 @@ fi
 
 # A program Supervisor has just loaded is STARTING for a second or so
 # (autostart), and starting it again would only fail with "already started".
-for _ in 1 2 3 4 5; do
-    status=$(supervisorctl status "$program" 2> /dev/null || true)
-    if [[ $status != *STARTING* ]] || $check_only; then
-        break
-    fi
-    sleep 1
-done
+status=$(program_status "$program")
 
 if [[ $status == *RUNNING* ]]; then
     ok "Supervisor runs $program"
