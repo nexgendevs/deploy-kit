@@ -168,9 +168,9 @@ It stops before changing anything if the deployed app has no `laravel/reverb`, t
 1. creates the apps folder `shared/reverb-apps`, readable by the user only (the files hold secrets);
 2. backs up `shared/.env`, sets `REVERB_SERVER_HOST=127.0.0.1`, `REVERB_SERVER_PORT` and `REVERB_APPS_PATH`, and rebuilds the config cache;
 3. writes the Supervisor program `/etc/supervisor/conf.d/<domain>-reverb.conf`: `php artisan reverb:start` on `127.0.0.1:<port>`, from `current/` as the user, restarted whenever it exits, log in `/var/log/supervisor/<domain>-reverb.log`;
-4. writes `~/conf/web/<domain>/nginx.ssl.conf_reverb`, which HestiaCP's nginx configuration includes and keeps when it rebuilds: WebSocket connections to `https://<domain>/app/` go to Reverb. Reverb's HTTP API (`/apps/`) is not proxied, since the apps publish on localhost, and the rest of the site stays as it is. A file `nginx -t` refuses is taken back out;
+4. writes `~/conf/web/<domain>/nginx.ssl.conf_reverb`, which HestiaCP's nginx configuration includes and keeps when it rebuilds: WebSocket connections to `https://<domain>/app/` go to Reverb. Reverb's HTTP API (`/apps/`) is not proxied, since the apps publish on localhost, and the rest of the site stays as it is. HestiaCP's proxy templates hide the `Upgrade` header for the whole site (Apache sends `Upgrade: h2,h2c`), and browsers refuse a WebSocket answer without one, so this location passes Reverb's through (`proxy_pass_header Upgrade`). A file `nginx -t` refuses is taken back out;
 5. records the server in `/etc/deploy-kit/reverb.conf` (user, domain, port, PHP version, apps folder) for `use-reverb`. There is one Reverb server per machine;
-6. checks Reverb answers on localhost, a WebSocket connection through nginx reaches it, `/up` answers, and `/apps/` does not.
+6. checks Reverb answers on localhost, a WebSocket connection through nginx reaches it with the headers a browser needs, `/up` answers, and `/apps/` does not.
 
 Reverb listens on localhost only, never on a public address; port 8080, its usual one, is HestiaCP's Apache. Deploys of the Reverb app need nothing more: `artisan reload` runs `reverb:restart`, Reverb closes its connections and stops, and Supervisor starts it on the new release. Browsers reconnect on their own within seconds.
 

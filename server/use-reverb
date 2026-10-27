@@ -304,6 +304,8 @@ event=$(reverb_first_event "https://$reverb_domain/app/$app_key" "$domain")
 
 if [[ $event == pusher:connection_established ]]; then
     ok "browsers on https://$domain connect to wss://$reverb_domain"
+elif [[ $event == no-upgrade-header ]]; then
+    warn "browsers refuse wss://$reverb_domain: nginx drops the Upgrade header (setup-reverb --check)"
 else
     warn "a browser on https://$domain gets ${event:-no answer} from wss://$reverb_domain (allowed origin? nginx?)"
 fi

@@ -366,13 +366,24 @@ reverb_api() {
 # (https://<Reverb domain>/app/<key>) the way a browser on https://<domain>
 # would, and prints the first event Reverb sends: pusher:connection_established
 # when it accepts the key and the origin, pusher:error when it refuses them,
-# nothing when nothing answers. Takes 3 seconds.
+# nothing when nothing answers. Prints no-upgrade-header for an answer
+# without "Upgrade: websocket", which browsers refuse (RFC 6455) although
+# curl does not. Takes 3 seconds.
 reverb_first_event() {
-    local frames
-    frames=$(curl -sS -N --http1.1 --max-time 3 \
+    local answer
+    answer=$(curl -sS -i -N --http1.1 --max-time 3 \
         -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' \
         -H "Sec-WebSocket-Key: $(openssl rand -base64 16)" -H "Origin: https://$2" \
         "$1?protocol=7&client=deploy-kit&version=1.0&flash=false" 2> /dev/null | tr -d '\0' || true)
 
-    grep -ao '"event":"[^"]*"' <<< "$frames" | head -n 1 | cut -d '"' -f 4 || true
+    if [[ ${answer%%$'\n'*} != *' 101 '* ]]; then
+        return 0
+    fi
+
+    if ! grep -aqiE '^upgrade:[[:space:]]*websocket' <<< "$answer"; then
+        echo no-upgrade-header
+        return 0
+    fi
+
+    grep -ao '"event":"[^"]*"' <<< "$answer" | head -n 1 | cut -d '"' -f 4 || true
 }

@@ -256,6 +256,9 @@ nginx_conf=$(
         '    proxy_set_header X-Forwarded-Proto $scheme;' \
         '    proxy_set_header Upgrade $http_upgrade;' \
         '    proxy_set_header Connection "upgrade";' \
+        "    # HestiaCP's proxy templates hide Apache's Upgrade header for the whole" \
+        '    # site; a WebSocket answer without one is refused by every browser.' \
+        '    proxy_pass_header Upgrade;' \
         '    # Reverb pings every connection at least once a minute.' \
         '    proxy_read_timeout 120s;' \
         '    proxy_send_timeout 120s;' \
@@ -342,7 +345,9 @@ for _ in 1 2 3; do
 done
 
 if [[ $event == pusher:* ]]; then
-    ok "WebSocket connections to https://$domain/app/ reach Reverb"
+    ok "WebSocket connections to https://$domain/app/ reach Reverb, as browsers need them"
+elif [[ $event == no-upgrade-header ]]; then
+    warn "nginx drops the Upgrade header from Reverb's answers, so browsers refuse the connection (proxy_pass_header Upgrade in ${nginx_file/#$home/\~})"
 else
     warn "no WebSocket answer from https://$domain/app/ (nginx: ${nginx_file/#$home/\~})"
 fi
