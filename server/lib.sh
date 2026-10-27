@@ -329,9 +329,12 @@ program_status() {
 reverb_conf=/etc/deploy-kit/reverb.conf
 
 # reverb_setting <name>: user, domain, port, php or apps from $reverb_conf,
-# or nothing.
+# or nothing, also when there is no $reverb_conf yet. (A failing sed would
+# end the calling script: set -e and pipefail.)
 reverb_setting() {
-    sed -n "s/^$1=//p" "$reverb_conf" 2> /dev/null | tail -n 1
+    if [[ -f $reverb_conf ]]; then
+        sed -n "s/^$1=//p" "$reverb_conf" | tail -n 1
+    fi
 }
 
 # random_token <length>: lower-case letters and digits, like Reverb's own
