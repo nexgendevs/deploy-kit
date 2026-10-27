@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+#
+# Moves a domain's queue to Redis and runs it with Horizon under Supervisor,
+# or checks it. Once per domain, as root, after use-redis (or add-domain)
+# and once the app with laravel/horizon is deployed. See server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: use-horizon [--check] [--php <version>] <user> <domain>
+
+Runs <domain>'s queue with Horizon (the app must have laravel/horizon and
+its cache and sessions on Redis already):
+  - if the queue was the database, works off the jobs still waiting there
+  - backs up shared/.env, then sets QUEUE_CONNECTION=redis
+  - rebuilds the config cache (artisan optimize)
+  - writes the Supervisor program /etc/supervisor/conf.d/<domain>-horizon.conf:
+    "php artisan horizon" from current/ as <user>, restarted whenever it
+    exits (every deploy ends it with horizon:terminate, so it comes back on
+    the new release); log in /var/log/supervisor/<domain>-horizon.log
+  - starts it and checks Horizon reports running
+The dashboard is at https://<domain>/horizon, for the app's top admin role.
+
+--check  only report; change nothing
+--php    PHP version, as in the app's deploy.php (default 8.4)
+
+Running it again is safe: it only changes what is missing.
+TEXT
+}
+
+php=8.4
+args=()
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        --php)
+            php=${2:-}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#args[@]} != 2)); then
+    usage
+    exit 1
+fi
+
+user=${args[0]}
+domain=${args[1]}
+
+if [[ ! $user =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    die "'$user' is not a valid user name."
+fi
+
+if [[ ! $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    die "'$domain' is not a domain name (lower case, no scheme or path)."
+fi
+
+if [[ ! $php =~ ^[0-9]+\.[0-9]+$ ]]; then
+    die "'$php' is not a PHP version (for example 8.4)."
+fi
+
+require_root_and_hestia
+
+if ! command -v supervisorctl > /dev/null; then
+    die 'Supervisor is not installed: apt install supervisor'
+fi
+
+if ! user_exists "$user"; then
+    die "There is no HestiaCP user $user."
+fi
+
+home=$(user_field "$user" HOME)
+env_file="$home/web/$domain/public_html/shared/.env"
+current="$home/web/$domain/public_html/current"
+php_bin="/usr/bin/php$php"
+program="$domain-horizon"
+program_file="/etc/supervisor/conf.d/$program.conf"
+log_file="/var/log/supervisor/$program.log"
+
+if [[ -L $env_file || ! -s $env_file ]]; then
+    die "$env_file is missing (or a symbolic link). Set the domain up with add-domain first."
+fi
+
+if [[ ! -L $current ]]; then
+    die "$domain is not deployed yet. Deploy the app first."
+fi
+
+if [[ ! -d $current/vendor/laravel/horizon ]]; then
+    die "The deployed app has no laravel/horizon. Deploy the app's Horizon change first; nothing was changed."
+fi
+
+if [[ $(env_value REDIS_USERNAME) != "$domain" || $(env_value CACHE_STORE) != redis ]]; then
+    die "$domain is not on Redis yet. Run use-redis $user $domain first; nothing was changed."
+fi
+
+if $check_only; then
+    echo "Checking Horizon for $domain (nothing will be changed)"
+else
+    echo "Running $domain's queue with Horizon"
+fi
+
+artisan() {
+    runuser -u "$user" -- "$php_bin" "$current/artisan" "$@"
+}
+
+section 'Queue'
+
+queue=$(env_value QUEUE_CONNECTION)
+
+if [[ $queue == redis ]]; then
+    ok 'QUEUE_CONNECTION=redis'
+elif needs "QUEUE_CONNECTION=redis (now ${queue:-database, the default})"; then
+    # Jobs waiting in the database queue would stay there: work them off
+    # first, with the settings the app runs with now.
+    if [[ -z $queue || $queue == database ]]; then
+        run runuser -u "$user" -- "$php_bin" "$current/artisan" queue:work database --stop-when-empty --tries=3 --timeout=60
+    fi
+
+    backup_env
+    set_env QUEUE_CONNECTION redis
+    optimize_or_restore
+    added "QUEUE_CONNECTION=redis (backup: shared/$(basename "$env_backup"))"
+fi
+
+section 'Supervisor'
+
+program_conf=$(
+    printf '%s\n' \
+        "; deploy-kit (use-horizon): Horizon for $domain. Rewritten by use-horizon." \
+        "[program:$program]" \
+        "command=$php_bin $current/artisan horizon" \
+        "user=$user" \
+        "directory=$home/web/$domain/public_html" \
+        'autostart=true' \
+        'autorestart=true' \
+        'stopasgroup=true' \
+        'killasgroup=true' \
+        '; Longer than the job timeout (60 s), so running jobs can finish.' \
+        'stopwaitsecs=120' \
+        'redirect_stderr=true' \
+        "stdout_logfile=$log_file" \
+        'stdout_logfile_maxbytes=10MB' \
+        'stdout_logfile_backups=3'
+)
+
+if [[ -f $program_file && $(< "$program_file") == "$program_conf" ]]; then
+    ok "$program_file"
+elif needs "$program_file"; then
+    refuse_in_check_mode 'Supervisor program'
+    printf '%s\n' "$program_conf" > "$program_file"
+    run supervisorctl reread
+    run supervisorctl update "$program"
+    added "$program_file (loaded)"
+fi
+
+status=$(supervisorctl status "$program" 2> /dev/null || true)
+
+if [[ $status == *RUNNING* ]]; then
+    ok "Supervisor runs $program"
+elif needs "Supervisor runs $program (now: ${status:-not loaded})"; then
+    run supervisorctl start "$program"
+    added "Supervisor runs $program"
+fi
+
+section 'Horizon'
+
+# Horizon needs a few seconds after a start to register its master.
+for _ in 1 2 3 4 5 6; do
+    horizon_status=$(artisan horizon:status 2>&1 || true)
+    if [[ $horizon_status == *'is running'* ]] || $check_only; then
+        break
+    fi
+    sleep 2
+done
+
+if [[ $horizon_status == *'is running'* ]]; then
+    ok 'horizon:status: running'
+else
+    warn "horizon:status: $(tr -s ' \n' ' ' <<< "$horizon_status") (log: $log_file)"
+fi
+
+dashboard=$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "https://$domain/horizon" 2> /dev/null || true)
+
+if [[ $dashboard == 403 ]]; then
+    ok "https://$domain/horizon refuses visitors who are not signed in (403)"
+else
+    warn "https://$domain/horizon answers $dashboard to visitors who are not signed in; it should be 403"
+fi
+
+finish

@@ -8,6 +8,7 @@ The one-time steps for a HestiaCP server that hosts apps deployed with deploy-ki
 | `add-user` | once per user (one per brand) | the HestiaCP user, shell, GitHub read access, the deploy key |
 | `add-domain` | once per domain, and again after its first deploy | web domain, HTTPS, templates, `shared/.env`, database, Redis user, cron |
 | `use-redis` | once per domain set up before Redis | moves its cache and sessions to Redis |
+| `use-horizon` | once per domain, when its app has `laravel/horizon` | runs its queue with Horizon under Supervisor |
 
 All run as root, only add what is missing (running them again is safe), and with `--check` only report. Like the rest of this repository, nothing here names a server, a client or a secret: those are arguments, or live in each app's `docs/deployment.md`.
 
@@ -63,6 +64,8 @@ The scripts expect HestiaCP with Apache, the nginx proxy, PHP-FPM and MariaDB.
 
     Logins are ACL users. The `default` user is off. `admin`, whose password is in `/etc/redis/admin.pass` (readable by root only), is what the scripts use. Every domain has its own user, named after the domain, that may only use keys under `<domain>:` and no dangerous commands (`FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG`…). One portal can't read another's sessions or queued mail. Because of this, `php artisan cache:clear` (which runs `FLUSHDB`) is refused; caches expire on their own. `setup-redis` also sets `vm.overcommit_memory = 1`, which Redis needs to save in the background reliably.
 
+11. **Supervisor**, which keeps each domain's Horizon running: `apt install supervisor`. Its programs live in `/etc/supervisor/conf.d/` (written by `use-horizon`), their logs in `/var/log/supervisor/`.
+
 `add-domain` refuses to run without items 6, 7 and 10, so a missed step shows up there.
 
 ## A new user: `add-user`
@@ -115,6 +118,23 @@ First the app's `config/database.php` must read `REDIS_CACHE_PORT` for its `cach
 
 Everybody signed in to the domain is signed out once: sessions don't move. Queues stay as they are and move to Redis together with Horizon.
 
+## A domain's queue with Horizon: `use-horizon`
+
+Apps with `laravel/horizon` run their queue with Horizon: one `php artisan horizon` process per domain, kept running by Supervisor. Once the app's Horizon change is deployed and the domain is on Redis (`use-redis`, or `add-domain` for new domains), run once per domain:
+
+```bash
+/opt/deploy-kit/server/use-horizon <user> <domain>
+```
+
+It stops before changing anything if the deployed app has no Horizon or the domain isn't on Redis. Otherwise:
+
+1. if the queue was the database, it works off the jobs still waiting there (`queue:work database --stop-when-empty`);
+2. backs up `shared/.env`, sets `QUEUE_CONNECTION=redis` and rebuilds the config cache, putting the backup back if that fails;
+3. writes the Supervisor program `/etc/supervisor/conf.d/<domain>-horizon.conf`: `php artisan horizon` from `current/` as the domain's user, restarted whenever it exits, log in `/var/log/supervisor/<domain>-horizon.log`;
+4. starts it, then checks that `horizon:status` reports running and that `https://<domain>/horizon` refuses visitors who are not signed in.
+
+Deploys need nothing more: `artisan reload` ends Horizon with `horizon:terminate`, and Supervisor starts it again on the new release. The app keeps Horizon's keys under its Redis prefix (`<domain>:horizon:`), the only keys its Redis user may use. `add-domain --check` reports a deployed app with Horizon whose queue doesn't run with it yet.
+
 ## Checking: `--check`
 
 `--check` changes nothing: every change goes through one function that refuses to run in this mode. It is safe on live servers at any time, for example after a HestiaCP upgrade:
@@ -143,4 +163,5 @@ Each line is `ok`, `added`, `todo` (missing, and the script can add it), `warn` 
 - Deploy key: one per app (the `DEPLOY_SSH_KEY` secret). Its public half is in every user that hosts the app, with the one-word comment `github-deploy-<repo>`. HestiaCP splits comments at spaces, and `add-user` uses the comment to find the key.
 - Database: `<user>_<name>`, with a login of the same name.
 - Redis: one ACL user per domain, named after the domain, on both instances with the same password (`REDIS_USERNAME` / `REDIS_PASSWORD`), limited to keys under `REDIS_PREFIX=<domain>:`. A Horizon prefix must start with it too (`<domain>:horizon:`).
+- Horizon: Supervisor program `<domain>-horizon`, log `/var/log/supervisor/<domain>-horizon.log`.
 - `shared/.env`: mode 600, owned by the user, written once. Deploys and these scripts never change it.

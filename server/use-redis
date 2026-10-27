@@ -96,27 +96,6 @@ else
     echo "Moving $domain's cache and sessions to Redis"
 fi
 
-# set_env <key> <value>: sets KEY=value in shared/.env as the site user,
-# replacing every KEY= line, or adding one at the end (on a new line even if
-# the file does not end with one). The value goes over stdin, so it shows up
-# neither in the process list nor in this output.
-set_env() {
-    refuse_in_check_mode "set $1"
-    printf '          $ set %s in shared/.env\n' "$1"
-
-    # shellcheck disable=SC2016
-    runuser -u "$user" -- bash -c '
-        IFS= read -r value
-        if grep -q "^$2=" "$1"; then
-            sed -i "s|^$2=.*|$2=$value|" "$1"
-        else
-            if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then
-                echo >> "$1"
-            fi
-            printf "%s=%s\n" "$2" "$value" >> "$1"
-        fi' _ "$env_file" "$1" <<< "$2" || die "Could not set $1 in $env_file."
-}
-
 section 'App'
 
 if [[ ! -L $current ]]; then
@@ -170,15 +149,14 @@ else
     names=$(for i in "${changes[@]}"; do printf '%s ' "${keys[i]}"; done)
 
     if needs "set ${names% } in shared/.env"; then
-        backup="$env_file.bak-$(date +%Y%m%d-%H%M%S)"
-        run runuser -u "$user" -- cp -p "$env_file" "$backup"
+        backup_env
 
         for i in "${changes[@]}"; do
             set_env "${keys[i]}" "${values[i]}"
         done
 
         env_changed=true
-        added "${names% } (backup: shared/$(basename "$backup"))"
+        added "${names% } (backup: shared/$(basename "$env_backup"))"
     fi
 fi
 
@@ -192,20 +170,7 @@ if [[ ! -L $current ]]; then
 fi
 
 if $env_changed; then
-    printf '          $ runuser -u %s -- %s %s/artisan optimize\n' "$user" "$php_bin" "$current"
-
-    if ! optimize_output=$(runuser -u "$user" -- "$php_bin" "$current/artisan" optimize 2>&1); then
-        printf '%s\n' "$optimize_output" >&2
-
-        # A failed optimize has already cleared the config cache, so the site
-        # reads the new .env on every request: put the old one back at once.
-        runuser -u "$user" -- cp -p "$backup" "$env_file"
-        runuser -u "$user" -- "$php_bin" "$current/artisan" optimize > /dev/null 2>&1 || true
-
-        die "artisan optimize failed with the new shared/.env (output above). The backup is back in place and the config cache rebuilt, so the site runs as before. The Redis user stays, unused."
-    fi
-
-    printf '%s\n' "$optimize_output" | sed 's/^/          /'
+    optimize_or_restore
 fi
 
 drivers=$(runuser -u "$user" -- "$php_bin" "$current/artisan" about --only=drivers --json 2> /dev/null || true)

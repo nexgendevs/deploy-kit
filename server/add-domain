@@ -503,6 +503,18 @@ elif needs 'scheduler cron entry'; then
     added 'scheduler cron entry'
 fi
 
+# Horizon runs the queue once the app has it (use-horizon sets it up).
+if [[ -d $current/vendor/laravel/horizon ]]; then
+    horizon_program="$domain-horizon"
+    horizon_state=$(supervisorctl status "$horizon_program" 2> /dev/null || true)
+
+    if [[ $(env_value QUEUE_CONNECTION) == redis && $horizon_state == *RUNNING* ]]; then
+        ok "Horizon runs the queue (Supervisor: $horizon_program)"
+    else
+        todo "queue with Horizon: run use-horizon $user $domain"
+    fi
+fi
+
 url="https://$domain"
 
 code=$(http_code "$url/up")
