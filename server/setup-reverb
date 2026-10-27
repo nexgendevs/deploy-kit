@@ -331,8 +331,16 @@ else
 fi
 
 # A key Reverb does not know: it answers the connection with pusher:error,
-# which shows the connection got through nginx to Reverb.
-event=$(reverb_first_event "https://$domain/app/deploy-kit-check" "$domain")
+# which shows the connection got through nginx to Reverb. Right after a
+# reload, nginx's old workers (without /app/) may still take the request.
+for _ in 1 2 3; do
+    event=$(reverb_first_event "https://$domain/app/deploy-kit-check" "$domain")
+    if [[ $event == pusher:* ]] || $check_only; then
+        break
+    fi
+    sleep 2
+done
+
 if [[ $event == pusher:* ]]; then
     ok "WebSocket connections to https://$domain/app/ reach Reverb"
 else
