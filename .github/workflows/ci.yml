@@ -59,3 +59,20 @@ jobs:
           for script in add-user add-domain setup-redis use-redis use-horizon setup-reverb use-reverb; do
             "server/$script" --help > /dev/null
           done
+
+      # lib.sh's lookups run under the scripts' set -euo pipefail, where a
+      # failing command inside one ends the whole script without a message.
+      - name: Check the lib.sh lookups
+        run: |
+          bash -c '
+            source server/lib.sh
+            reverb_conf=/tmp/deploy-kit-ci/missing.conf
+            value=$(reverb_setting domain)
+            [[ -z $value ]] || { echo "reverb_setting without a file gave: $value"; exit 1; }
+            mkdir -p /tmp/deploy-kit-ci
+            reverb_conf=/tmp/deploy-kit-ci/reverb.conf
+            printf "%s\n" "# comment" "domain=old.example.com" "domain=reverb.example.com" "port=8090" > "$reverb_conf"
+            [[ $(reverb_setting domain) == reverb.example.com && $(reverb_setting port) == 8090 && -z $(reverb_setting apps) ]] \
+              || { echo "reverb_setting read the file wrongly"; exit 1; }
+            echo "lookups ok"
+          '
