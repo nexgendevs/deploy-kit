@@ -240,6 +240,8 @@ fi
 
 section 'nginx'
 
+# $host, $remote_addr and the like are nginx's variables, not the shell's.
+# shellcheck disable=SC2016
 nginx_conf=$(
     printf '%s\n' \
         "# deploy-kit (setup-reverb): WebSocket connections at /app/ go to the shared" \
