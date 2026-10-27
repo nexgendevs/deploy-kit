@@ -515,6 +515,20 @@ if [[ -d $current/vendor/laravel/horizon ]]; then
     fi
 fi
 
+# Broadcasting goes through the shared Reverb server once the app can
+# broadcast to it (use-reverb sets it up). Reverb's own app has the same
+# package, but serves the others.
+reverb_domain=$(reverb_setting domain)
+if [[ $domain == "$reverb_domain" ]]; then
+    ok 'runs the shared Reverb server (setup-reverb --check checks it)'
+elif [[ -n $reverb_domain && -d $current/vendor/pusher/pusher-php-server ]]; then
+    if [[ -n $(env_value REVERB_APP_KEY) && -f $(reverb_setting apps)/$domain.json ]]; then
+        ok "broadcasts through the shared Reverb server ($reverb_domain)"
+    else
+        todo "broadcasting through Reverb: run use-reverb $user $domain"
+    fi
+fi
+
 url="https://$domain"
 
 code=$(http_code "$url/up")

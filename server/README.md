@@ -9,6 +9,8 @@ The one-time steps for a HestiaCP server that hosts apps deployed with deploy-ki
 | `add-domain` | once per domain, and again after its first deploy | web domain, HTTPS, templates, `shared/.env`, database, Redis user, cron |
 | `use-redis` | once per domain set up before Redis | moves its cache and sessions to Redis |
 | `use-horizon` | once per domain, when its app has `laravel/horizon` | runs its queue with Horizon under Supervisor |
+| `setup-reverb` | once per server, on the domain of a Reverb server app | the shared Reverb (WebSocket) server: Supervisor, nginx wss proxy |
+| `use-reverb` | once per domain whose app broadcasts | the domain's own Reverb app and its `REVERB_*` settings |
 
 All run as root, only add what is missing (running them again is safe), and with `--check` only report. Like the rest of this repository, nothing here names a server, a client or a secret: those are arguments, or live in each app's `docs/deployment.md`.
 
@@ -64,7 +66,8 @@ The scripts expect HestiaCP with Apache, the nginx proxy, PHP-FPM and MariaDB.
 
     Logins are ACL users. The `default` user is off. `admin`, whose password is in `/etc/redis/admin.pass` (readable by root only), is what the scripts use. Every domain has its own user, named after the domain, that may only use keys under `<domain>:` and no dangerous commands (`FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG`…). One portal can't read another's sessions or queued mail. Because of this, `php artisan cache:clear` (which runs `FLUSHDB`) is refused; caches expire on their own, and one domain's cache can be emptied by hand (see `use-redis` below). `setup-redis` also sets `vm.overcommit_memory = 1`, which Redis needs to save in the background reliably.
 
-11. **Supervisor**, which keeps each domain's Horizon running: `apt install supervisor`. Its programs live in `/etc/supervisor/conf.d/` (written by `use-horizon`), their logs in `/var/log/supervisor/`.
+11. **Supervisor**, which keeps each domain's Horizon running: `apt install supervisor`. Its programs live in `/etc/supervisor/conf.d/` (written by `use-horizon` and `setup-reverb`), their logs in `/var/log/supervisor/`.
+12. **Reverb**, if any app broadcasts: one shared server for all of them, set up with `setup-reverb` (below).
 
 `add-domain` refuses to run without items 6, 7 and 10, so a missed step shows up there.
 
@@ -97,7 +100,7 @@ The whole sequence for a new domain:
 2. **`add-domain`:** web domain with the PHP-FPM backend, Let's Encrypt, HTTPS redirect and HSTS, no custom document root, both `laravel` templates (checked in the generated Apache and nginx files), `shared/.env`, then the database and the domain's Redis user with the passwords from `shared/.env`. The new `.env` has only what every app needs: `APP_ENV`, a new `APP_KEY`, `APP_DEBUG=false`, `APP_URL`, `LOG_LEVEL`, the database login, `SESSION_SECURE_COOKIE=true`, and cache and sessions in Redis (`CACHE_STORE`, `SESSION_DRIVER`, the `REDIS_*` login, the ports and the prefix `<domain>:`). The app's `config/database.php` must read `REDIS_CACHE_PORT` for its `cache` connection, so caches go to the cache instance.
 3. **The app's own settings:** add them to `shared/.env` as the user, before the first deploy. The app's `docs/deployment.md` lists them (`APP_NAME`, queue, mail…).
 4. **Deploy:** add the site to the app's `deploy.php` and deploy.
-5. **`add-domain` again:** adds the scheduler's cron entry, then checks the site: `/up` answers 200, HTTP redirects to HTTPS, the HSTS header is sent, and `/.env`, `/shared/.env`, `/composer.json` and the like answer 404. The cron entry waits for the first deploy because HestiaCP emails cron output to the user's contact address, and `cd current` would fail every minute until then.
+5. **`add-domain` again:** adds the scheduler's cron entry, then checks the site: `/up` answers 200, HTTP redirects to HTTPS, the HSTS header is sent, and `/.env`, `/shared/.env`, `/composer.json` and the like answer 404. The cron entry waits for the first deploy because HestiaCP emails cron output to the user's contact address, and `cd current` would fail every minute until then. It also reports what the app needs from the scripts below: `use-horizon` for an app with Horizon, `use-reverb` for an app that can broadcast.
 6. **First administrator:** the app's `docs/deployment.md`.
 
 The script never changes an existing `shared/.env`. It only reports problems it finds there (the wrong `APP_URL`, a database login that fails, and with `--live` an `APP_ENV` other than production or `APP_DEBUG` not false), and you fix them by hand.
@@ -146,6 +149,47 @@ It stops before changing anything if the deployed app has no Horizon or the doma
 
 Deploys need nothing more: `artisan reload` ends Horizon with `horizon:terminate`, and Supervisor starts it again on the new release. The app keeps Horizon's keys under its Redis prefix (`<domain>:horizon:`), the only keys its Redis user may use. `add-domain --check` reports a deployed app with Horizon whose queue doesn't run with it yet.
 
+## The shared Reverb server: `setup-reverb`
+
+Apps that broadcast (Laravel Echo in the browser) share one [Reverb](https://laravel.com/docs/reverb) server, with one Reverb app (its own id, key and secret) per domain. The server is a small Laravel app with `laravel/reverb` and nothing else, on a domain of its own, set up and deployed like any other (`add-user`, `add-domain --live`, first deploy). Its `config/reverb.php` must read the apps from the JSON files in `REVERB_APPS_PATH`, one per domain:
+
+```json
+{"app_id": "…", "key": "…", "secret": "…", "allowed_origins": ["shop.example.com"]}
+```
+
+It should leave out a file that is invalid or allows `*` or wildcard origins, so one bad file never stops the server for the others. Once that app is deployed, as root:
+
+```bash
+/opt/deploy-kit/server/setup-reverb <user> <domain> [--port 8090]
+```
+
+It stops before changing anything if the deployed app has no `laravel/reverb`, the domain's nginx configuration doesn't include `nginx.ssl.conf_*` files (the `laravel` proxy template does), or something else listens on the port. Otherwise:
+
+1. creates the apps folder `shared/reverb-apps`, readable by the user only (the files hold secrets);
+2. backs up `shared/.env`, sets `REVERB_SERVER_HOST=127.0.0.1`, `REVERB_SERVER_PORT` and `REVERB_APPS_PATH`, and rebuilds the config cache;
+3. writes the Supervisor program `/etc/supervisor/conf.d/<domain>-reverb.conf`: `php artisan reverb:start` on `127.0.0.1:<port>`, from `current/` as the user, restarted whenever it exits, log in `/var/log/supervisor/<domain>-reverb.log`;
+4. writes `~/conf/web/<domain>/nginx.ssl.conf_reverb`, which HestiaCP's nginx configuration includes and keeps when it rebuilds: WebSocket connections to `https://<domain>/app/` go to Reverb. Reverb's HTTP API (`/apps/`) is not proxied, since the apps publish on localhost, and the rest of the site stays as it is. A file `nginx -t` refuses is taken back out;
+5. records the server in `/etc/deploy-kit/reverb.conf` (user, domain, port, PHP version, apps folder) for `use-reverb`. There is one Reverb server per machine;
+6. checks Reverb answers on localhost, a WebSocket connection through nginx reaches it, `/up` answers, and `/apps/` does not.
+
+Reverb listens on localhost only, never on a public address; port 8080, its usual one, is HestiaCP's Apache. Deploys of the Reverb app need nothing more: `artisan reload` runs `reverb:restart`, Reverb closes its connections and stops, and Supervisor starts it on the new release. Browsers reconnect on their own within seconds.
+
+**Capacity.** Reverb's default event loop (PHP's `stream_select`) handles about 1,000 connections at once, for all apps together; each open browser tab of a signed-in user is one. Raising the open-files limit alone doesn't help: past 1,024 descriptors `stream_select` fails for everyone instead of refusing new connections, so the program keeps Supervisor's limit of 1,024. Before that becomes too few, install the `uv` extension for the CLI PHP (`apt install php<version>-dev libuv1-dev`, `pecl install uv`, enable it for the CLI only), which Reverb then uses on its own, and set `minfds=10000` in the `[supervisord]` section of `/etc/supervisor/supervisord.conf`. Restarting Supervisor for that restarts every program, Horizon included.
+
+## A domain that broadcasts: `use-reverb`
+
+Once the server runs and the app's broadcasting change is deployed (Laravel's `reverb` broadcaster needs `pusher/pusher-php-server`), once per domain:
+
+```bash
+/opt/deploy-kit/server/use-reverb <user> <domain>
+```
+
+1. creates the domain's Reverb app: a new app id, key and secret, accepting WebSocket connections from `https://<domain>` only, as `<domain>.json` in the apps folder (mode 600, owned by the Reverb server's user). A domain whose `shared/.env` already has `REVERB_APP_*` keeps them. Reverb restarts to load the new app, so every connected browser, on every domain, reconnects once;
+2. backs up `shared/.env`, then sets `BROADCAST_CONNECTION=reverb`, `REVERB_APP_ID`, `REVERB_APP_KEY`, `REVERB_APP_SECRET`, and `REVERB_HOST=127.0.0.1`, `REVERB_PORT=<port>`, `REVERB_SCHEME=http`: the app publishes its events to Reverb on localhost, not through the internet. Browsers get `VITE_REVERB_HOST=<Reverb's domain>`, `VITE_REVERB_PORT=443`, `VITE_REVERB_SCHEME=https` and `VITE_REVERB_APP_KEY`. The values never appear in its output;
+3. rebuilds the config cache, then checks that the app broadcasts with `reverb`, Reverb accepts the app's signed requests, the app's own broadcaster can publish an event, and a browser on the domain gets `pusher:connection_established` from `wss://<Reverb's domain>`.
+
+`VITE_*` values are built into the app's JavaScript when a release is built, so browsers get the key with the next deploy. Until then the script reports that the deployed build has no key.
+
 ## Checking: `--check`
 
 `--check` changes nothing: every change goes through one function that refuses to run in this mode. It is safe on live servers at any time, for example after a HestiaCP upgrade:
@@ -175,4 +219,5 @@ Each line is `ok`, `added`, `todo` (missing, and the script can add it), `warn` 
 - Database: `<user>_<name>`, with a login of the same name.
 - Redis: one ACL user per domain, named after the domain, on both instances with the same password (`REDIS_USERNAME` / `REDIS_PASSWORD`), limited to keys under `REDIS_PREFIX=<domain>:`. A Horizon prefix must start with it too (`<domain>:horizon:`).
 - Horizon: Supervisor program `<domain>-horizon`, log `/var/log/supervisor/<domain>-horizon.log`.
-- `shared/.env`: mode 600, owned by the user, written once by `add-domain`. Deploys never change it. `use-redis` and `use-horizon` change only their own keys, after a backup (`.env.bak-<date>`).
+- Reverb: one server per machine, Supervisor program `<Reverb domain>-reverb` on `127.0.0.1:8090`, recorded in `/etc/deploy-kit/reverb.conf`. One Reverb app per domain: `<domain>.json` in the server's `shared/reverb-apps/`, allowed from its own domain only.
+- `shared/.env`: mode 600, owned by the user, written once by `add-domain`. Deploys never change it. `use-redis`, `use-horizon`, `setup-reverb` and `use-reverb` change only their own keys, after a backup (`.env.bak-<date>`).
