@@ -62,7 +62,7 @@ The scripts expect HestiaCP with Apache, the nginx proxy, PHP-FPM and MariaDB.
     | `cache` | 6380 | caches | 256 MB | evicts the least recently used keys | nothing |
     | `data` | 6381 | sessions and queues | 512 MB | refuses writes, never drops a session or job | append-only file every second, plus snapshots |
 
-    Logins are ACL users. The `default` user is off. `admin`, whose password is in `/etc/redis/admin.pass` (readable by root only), is what the scripts use. Every domain has its own user, named after the domain, that may only use keys under `<domain>:` and no dangerous commands (`FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG`…). One portal can't read another's sessions or queued mail. Because of this, `php artisan cache:clear` (which runs `FLUSHDB`) is refused; caches expire on their own. `setup-redis` also sets `vm.overcommit_memory = 1`, which Redis needs to save in the background reliably.
+    Logins are ACL users. The `default` user is off. `admin`, whose password is in `/etc/redis/admin.pass` (readable by root only), is what the scripts use. Every domain has its own user, named after the domain, that may only use keys under `<domain>:` and no dangerous commands (`FLUSHALL`, `FLUSHDB`, `KEYS`, `CONFIG`…). One portal can't read another's sessions or queued mail. Because of this, `php artisan cache:clear` (which runs `FLUSHDB`) is refused; caches expire on their own, and one domain's cache can be emptied by hand (see `use-redis` below). `setup-redis` also sets `vm.overcommit_memory = 1`, which Redis needs to save in the background reliably.
 
 11. **Supervisor**, which keeps each domain's Horizon running: `apt install supervisor`. Its programs live in `/etc/supervisor/conf.d/` (written by `use-horizon`), their logs in `/var/log/supervisor/`.
 
@@ -118,6 +118,17 @@ First the app's `config/database.php` must read `REDIS_CACHE_PORT` for its `cach
 
 Everybody signed in to the domain is signed out once: sessions don't move. Queues stay as they are and move to Redis together with Horizon.
 
+`php artisan cache:clear` is refused (checklist item 10). To empty one domain's cache by hand, as root: this deletes only that domain's keys on the `cache` instance, so sessions and queues stay. `REDISCLI_AUTH` keeps the admin password out of the process list.
+
+```bash
+D=shop.example.com
+export REDISCLI_AUTH="$(cat /etc/redis/admin.pass)"
+R='redis-cli --user admin -p 6380'
+$R --scan --pattern "$D:*" | wc -l      # how many keys
+$R --scan --pattern "$D:*" | xargs -r -d '\n' $R UNLINK
+unset REDISCLI_AUTH
+```
+
 ## A domain's queue with Horizon: `use-horizon`
 
 Apps with `laravel/horizon` run their queue with Horizon: one `php artisan horizon` process per domain, kept running by Supervisor. Once the app's Horizon change is deployed and the domain is on Redis (`use-redis`, or `add-domain` for new domains), run once per domain:
@@ -164,4 +175,4 @@ Each line is `ok`, `added`, `todo` (missing, and the script can add it), `warn` 
 - Database: `<user>_<name>`, with a login of the same name.
 - Redis: one ACL user per domain, named after the domain, on both instances with the same password (`REDIS_USERNAME` / `REDIS_PASSWORD`), limited to keys under `REDIS_PREFIX=<domain>:`. A Horizon prefix must start with it too (`<domain>:horizon:`).
 - Horizon: Supervisor program `<domain>-horizon`, log `/var/log/supervisor/<domain>-horizon.log`.
-- `shared/.env`: mode 600, owned by the user, written once. Deploys and these scripts never change it.
+- `shared/.env`: mode 600, owned by the user, written once by `add-domain`. Deploys never change it. `use-redis` and `use-horizon` change only their own keys, after a backup (`.env.bak-<date>`).
