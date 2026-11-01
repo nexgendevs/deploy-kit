@@ -123,8 +123,10 @@ elif needs "SENTRY_LARAVEL_DSN: the DSN of the app's Sentry project"; then
     fi
 
     echo "          Paste the DSN of the app's Sentry project (Project settings, Client Keys),"
-    echo '          or press Enter to skip:'
-    read -r dsn || true
+    echo '          then press Enter; it does not show. Enter alone skips:'
+    # -s: the terminal does not echo it, so it stays off the screen.
+    read -rs dsn || true
+    echo
     dsn=${dsn//[[:space:]]/}
 
     if [[ -z $dsn ]]; then
@@ -133,6 +135,7 @@ elif needs "SENTRY_LARAVEL_DSN: the DSN of the app's Sentry project"; then
         die 'That is not a Sentry DSN (https://<key>@o<number>.ingest...sentry.io/<number>). Nothing was changed.'
     else
         new_dsn=true
+        ok "DSN read (project ${dsn##*/})"
     fi
 fi
 

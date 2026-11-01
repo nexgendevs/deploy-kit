@@ -199,7 +199,7 @@ Errors go to [Sentry](https://sentry.io): one Sentry project per app, and within
 /opt/deploy-kit/server/use-monitoring <user> <domain>
 ```
 
-1. asks for the project's DSN (Sentry: project settings, Client Keys) and keeps it in `shared/.env`. Paste it straight from Sentry; it never appears in the output. It warns about a DSN outside Sentry's EU region (`ingest.de.sentry.io`);
+1. asks for the project's DSN (Sentry: project settings, Client Keys) and keeps it in `shared/.env`. Paste it straight from Sentry: the terminal does not show it, and the script never prints it. It warns about a DSN outside Sentry's EU region (`ingest.de.sentry.io`);
 2. backs up `shared/.env`, then sets `SENTRY_LARAVEL_DSN`, `SENTRY_ENVIRONMENT=<domain>`, `LOG_STACK=daily` and `LOG_DAILY_DAYS=14` (Laravel's own log, one file a day, kept two weeks), and rebuilds the config cache;
 3. with a new DSN, sends one test event (`artisan sentry:test`). It shows up in Sentry and, with the project's default alert rule, as an email;
 4. checks that the app reports to Sentry as its domain, that its `config/sentry.php` limits what Sentry collects (`data_collection`), that it logs daily, that `/up` answers, and, for an app with Horizon, that its scheduler queues the heartbeat job.
