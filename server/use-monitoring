@@ -17,7 +17,8 @@ environment, and rotates its log daily:
     keeps it in shared/.env; a DSN already there stays
   - backs up shared/.env, then sets SENTRY_LARAVEL_DSN,
     SENTRY_ENVIRONMENT=<domain>, LOG_STACK=daily and LOG_DAILY_DAYS=14,
-    and rebuilds the config cache (artisan optimize)
+    rebuilds the config cache (artisan optimize) and restarts Horizon
+    gracefully, so its workers read the new settings
   - sends one test event (artisan sentry:test) when the DSN is new: it shows
     up in Sentry and tests the alert email
   - checks the app reports to Sentry with its data collection limits, logs
@@ -183,6 +184,14 @@ fi
 
 if $env_changed; then
     optimize_or_restore
+
+    # Horizon's workers keep the config they started with: without a restart
+    # the heartbeat and errors in queued jobs would not reach Sentry until
+    # the next deploy. horizon:terminate lets running jobs finish, and
+    # Supervisor starts Horizon again, as after every deploy.
+    if [[ -d $current/vendor/laravel/horizon && $(supervisorctl status "$domain-horizon" 2> /dev/null || true) == *RUNNING* ]]; then
+        run runuser -u "$user" -- "$php_bin" "$current/artisan" horizon:terminate
+    fi
 fi
 
 section 'Checks'
