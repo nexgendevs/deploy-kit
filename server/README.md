@@ -11,7 +11,7 @@ The one-time steps for a HestiaCP server that hosts apps deployed with deploy-ki
 | `use-horizon` | once per domain, when its app has `laravel/horizon` | runs its queue with Horizon under Supervisor |
 | `setup-reverb` | once per server, on the domain of a Reverb server app | the shared Reverb (WebSocket) server: Supervisor, nginx wss proxy |
 | `use-reverb` | once per domain whose app broadcasts | the domain's own Reverb app and its `REVERB_*` settings |
-| `use-monitoring` | once per domain, when its app has `sentry/sentry-laravel` | errors to the app's Sentry project, daily logs |
+| `use-monitoring` | once per domain, when its app has `sentry/sentry-laravel` | errors to the brand's Sentry project, daily logs |
 
 All run as root, only add what is missing (running them again is safe), and with `--check` only report. Like the rest of this repository, nothing here names a server, a client or a secret: those are arguments, or live in each app's `docs/deployment.md`.
 
@@ -193,7 +193,7 @@ Once the server runs and the app's broadcasting change is deployed (Laravel's `r
 
 ## A domain's errors to Sentry: `use-monitoring`
 
-Errors go to [Sentry](https://sentry.io): one Sentry project per app, and within it one environment per domain. Once the app's `sentry/sentry-laravel` is deployed, once per domain:
+Errors go to [Sentry](https://sentry.io): one Sentry project per brand (company; one app can serve several brands), and within it one environment per domain, so a brand's live and dev sites share a project. Once the app's `sentry/sentry-laravel` is deployed, once per domain:
 
 ```bash
 /opt/deploy-kit/server/use-monitoring <user> <domain>
@@ -235,6 +235,6 @@ Each line is `ok`, `added`, `todo` (missing, and the script can add it), `warn` 
 - Database: `<user>_<name>`, with a login of the same name.
 - Redis: one ACL user per domain, named after the domain, on both instances with the same password (`REDIS_USERNAME` / `REDIS_PASSWORD`), limited to keys under `REDIS_PREFIX=<domain>:`. A Horizon prefix must start with it too (`<domain>:horizon:`).
 - Horizon: Supervisor program `<domain>-horizon`, log `/var/log/supervisor/<domain>-horizon.log`.
-- Sentry: one project per app, `SENTRY_ENVIRONMENT=<domain>`, a cron monitor `queue-heartbeat` per app (its environments are the domains) and an uptime monitor per domain on `https://<domain>/up`.
+- Sentry: one project per brand, `SENTRY_ENVIRONMENT=<domain>`, a cron monitor `queue-heartbeat` per project (its environments are the domains) and an uptime monitor per domain on `https://<domain>/up`.
 - Reverb: one server per machine, Supervisor program `<Reverb domain>-reverb` on `127.0.0.1:8090`, recorded in `/etc/deploy-kit/reverb.conf`. One Reverb app per domain: `<domain>.json` in the server's `shared/reverb-apps/`, allowed from its own domain only.
 - `shared/.env`: mode 600, owned by the user, written once by `add-domain`. Deploys never change it. `use-redis`, `use-horizon`, `setup-reverb`, `use-reverb` and `use-monitoring` change only their own keys, after a backup (`.env.bak-<date>`).
