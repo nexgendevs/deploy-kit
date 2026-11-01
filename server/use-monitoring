@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Connects a domain to its app's Sentry project and keeps its logs for two
+# Connects a domain to its brand's Sentry project and keeps its logs for two
 # weeks, or checks it. Once per domain, as root, once the app's monitoring
 # change (sentry/sentry-laravel) is deployed. See server/README.md.
 
@@ -11,7 +11,7 @@ usage() {
     cat << 'TEXT'
 Usage: use-monitoring [--check] [--php <version>] <user> <domain>
 
-Sends <domain>'s errors to its app's Sentry project, with the domain as the
+Sends <domain>'s errors to its brand's Sentry project, with the domain as the
 environment, and rotates its log daily:
   - asks for the project's DSN (Sentry: project settings, Client Keys) and
     keeps it in shared/.env; a DSN already there stays
@@ -118,12 +118,12 @@ if [[ -n $dsn && $dsn =~ $dsn_pattern ]]; then
     ok "SENTRY_LARAVEL_DSN set (project ${dsn##*/})"
 elif [[ -n $dsn ]]; then
     warn 'SENTRY_LARAVEL_DSN in shared/.env does not look like a Sentry DSN'
-elif needs "SENTRY_LARAVEL_DSN: the DSN of the app's Sentry project"; then
+elif needs "SENTRY_LARAVEL_DSN: the DSN of the domain's Sentry project"; then
     if [[ ! -t 0 ]]; then
         die 'Run this in a terminal: it asks for the DSN.'
     fi
 
-    echo "          Paste the DSN of the app's Sentry project (Project settings, Client Keys),"
+    echo "          Paste the DSN of the domain's Sentry project (Project settings, Client Keys),"
     echo '          then press Enter; it does not show. Enter alone skips:'
     # -s: the terminal does not echo it, so it stays off the screen.
     read -rs dsn || true
