@@ -376,7 +376,7 @@ fi
 # Every file is the local user's, 644 and folders 755, whatever they were.
 stream runuser -u "$user" -- rsync -rlpt --delete --info=stats1,progress2 \
     --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
-    --exclude=/.env --exclude=/node_modules/ \
+    --exclude=/.env --exclude=/.htaccess --exclude=/node_modules/ \
     --exclude='/storage/logs/**' --exclude='/storage/framework/cache/**' \
     --exclude='/storage/framework/sessions/**' --exclude='/storage/framework/views/**' \
     --exclude='/bootstrap/cache/*.php' \
@@ -385,6 +385,13 @@ stream runuser -u "$user" -- rsync -rlpt --delete --info=stats1,progress2 \
 for folder in storage/logs storage/framework/cache/data storage/framework/sessions storage/framework/views bootstrap/cache; do
     as_user mkdir -p "$app_dir/$folder"
 done
+
+# The web root here is public/. A .htaccess in the app folder belonged to the
+# old host's layout, and Apache here reads it (it is above the web root) and
+# may refuse it with a 500 (a cPanel PHP handler did).
+if [[ -f $app_dir/.htaccess ]]; then
+    run runuser -u "$user" -- rm -f "$app_dir/.htaccess"
+fi
 
 # A public/storage link points at the old server's path: point it here.
 if [[ -L $app_dir/public/storage ]]; then
