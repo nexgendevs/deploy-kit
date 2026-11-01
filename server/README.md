@@ -12,6 +12,7 @@ The one-time steps for a HestiaCP server that hosts apps deployed with deploy-ki
 | `setup-reverb` | once per server, on the domain of a Reverb server app | the shared Reverb (WebSocket) server: Supervisor, nginx wss proxy |
 | `use-reverb` | once per domain whose app broadcasts | the domain's own Reverb app and its `REVERB_*` settings |
 | `use-monitoring` | once per domain, when its app has `sentry/sentry-laravel` | errors to the brand's Sentry project, daily logs |
+| `fetch-site` | as often as needed, to move a site here from another server | a fresh copy of that site's database and files on a domain here |
 
 All run as root, only add what is missing (running them again is safe), and with `--check` only report. Like the rest of this repository, nothing here names a server, a client or a secret: those are arguments, or live in each app's `docs/deployment.md`.
 
@@ -205,6 +206,37 @@ Errors go to [Sentry](https://sentry.io): one Sentry project per brand (company;
 4. checks that the app reports to Sentry as its domain, that its `config/sentry.php` limits what Sentry collects (`data_collection`), that it logs daily, that `/up` answers, and, for an app with Horizon, that its scheduler queues the heartbeat job.
 
 The apps decide what a report may carry, not this script: for health data, no user, cookies, request bodies, query strings, SQL values, job payloads or frame variables, and query errors with `?` placeholders (`mask_bindings_in_exception_messages`). They also do the two things Sentry watches from outside. The **heartbeat**, queued by the scheduler every five minutes and run by Horizon, checks in with a Sentry cron monitor, which alerts when the check-ins stop: the scheduler or the queue is down. **`/up`** asks the database and Redis too (the Reverb server's asks Reverb), and a Sentry uptime monitor per domain, added in Sentry itself, checks it from outside.
+
+## A site from another server: `fetch-site`
+
+To move a Laravel site that runs elsewhere (not deployed with deploy-kit) onto this server, `fetch-site` copies it one way, as often as needed: test the copy on a domain of its own, fetch again, and so on until the move itself. Every run replaces the copy with a fresh one.
+
+Set up the local side in HestiaCP first: the user, the web domain (Let's Encrypt on) and an empty database, and the PHP version the old server runs (`v-add-web-php <version>`). Then describe the site in `/etc/deploy-kit/fetch/<name>.conf`, owned by root, mode 600 (it names the old server, so it stays off this repository):
+
+```text
+remote=account@old.example.com
+port=22
+remote_dir=public_html
+user=shop-legacy
+domain=shop-copy.example.com
+database=shop-legacy_copy
+php=8.2
+```
+
+```bash
+/opt/deploy-kit/server/fetch-site <name>
+```
+
+The first run creates the local user's SSH key (`~/.ssh/fetch_<name>`) and prints the line to add to the old account's `~/.ssh/authorized_keys`, limited with `from=` to logins from this server. Every run after that:
+
+1. looks at the old site, read-only: Laravel and PHP versions, `mysqldump`, and that its files are on its own disk (it stops if `FILESYSTEM_DISK` is a cloud bucket, which a copy would share);
+2. sets the domain's PHP-FPM backend and the `laravel` web and proxy templates (web root `public_html/current/public`);
+3. **database:** empties the local database, then imports a consistent `mysqldump` from the old server, gzipped through SSH. The old login is read from the app's `.env` on the old server and never leaves it. The local login keeps its password, or gets a new one through HestiaCP;
+4. **files:** `rsync --delete` of the app folder into `public_html/current`, every file the local user's (644, folders 755), without `.env`, `node_modules`, logs, caches and sessions. After the first run only changes travel. A `public/storage` link is pointed at this copy's `storage/app/public`;
+5. **`.env`:** the old site's, so `APP_KEY` and everything encrypted with it still work, with this copy's URL and database, no `SESSION_DOMAIN` or `SANCTUM_STATEFUL_DOMAINS`, and `MAIL_MAILER=log`, `BROADCAST_DRIVER=log`, `QUEUE_CONNECTION=sync`: a copy never emails, notifies or broadcasts to the live site's users. It gets no cron entry either;
+6. checks the app reads its database (`migrate:status`), PHP has every extension `vendor/` needs (`composer check-platform-reqs`), the site answers, and prints how long the database, the files and the whole run took.
+
+`--check` connects to the old server and reports, copying nothing. It also warns while the domain has no HTTP password: a copy holds real data, so protect it with `v-add-web-domain-httpauth <user> <domain> <name> <password>` until it goes live.
 
 ## Checking: `--check`
 

@@ -1,0 +1,466 @@
+#!/usr/bin/env bash
+#
+# Copies a Laravel site from another server over SSH (its database and its
+# files, one way) into a domain on this server, or checks it. As root, as
+# often as needed: every run replaces the copy with a fresh one. See
+# server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: fetch-site [--check] <name>
+
+Copies the site described in /etc/deploy-kit/fetch/<name>.conf from its old
+server into a domain here, replacing the previous copy:
+  - the database: a consistent mysqldump on the old server (its login read
+    there from the app's .env), streamed over SSH and imported into the
+    local database after emptying it
+  - the files: rsync of the app folder into public_html/current, without
+    .env, node_modules, logs, caches and sessions; files gone on the old
+    server are removed here
+  - .env: the old server's, with this copy's URL and database, and mail,
+    broadcasting and the queue kept local (MAIL_MAILER=log,
+    BROADCAST_DRIVER=log, QUEUE_CONNECTION=sync), so the copy never emails
+    or notifies anyone
+  - the domain: its PHP version and the laravel web and proxy templates
+    (web root current/public)
+  - checks: the app reaches its database, PHP has the extensions vendor/
+    needs, the site answers; and how long each part took
+The copy gets no cron entry: nothing scheduled runs.
+
+The first run creates an SSH key for the local user and prints the line to
+add to the old account's ~/.ssh/authorized_keys; run it again after that.
+
+--check  only report (connects to the old server, copies nothing)
+
+The config file, root only, one key=value per line:
+  remote=account@host      the old server's SSH login
+  port=22                  its SSH port
+  remote_dir=public_html   the app folder, relative to the account's home
+  user=<hestia user>       the local user that owns the domain
+  domain=<domain>          the local domain (set up with HestiaCP)
+  database=<database>      the local database (HestiaCP, full name)
+  php=8.2                  the PHP version, as on the old server
+TEXT
+}
+
+args=()
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#args[@]} != 1)); then
+    usage
+    exit 1
+fi
+
+name=${args[0]}
+
+if [[ ! $name =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    die "'$name' is not a valid name (a-z, 0-9, dashes)."
+fi
+
+require_root_and_hestia
+
+for tool in rsync ssh gzip; do
+    if ! command -v "$tool" > /dev/null; then
+        die "$tool is not installed."
+    fi
+done
+
+conf_file=/etc/deploy-kit/fetch/$name.conf
+
+if [[ ! -f $conf_file ]]; then
+    die "$conf_file is missing (see --help for its contents)."
+fi
+
+if [[ $(stat -c '%U %a' "$conf_file") != 'root 600' ]]; then
+    die "$conf_file must be owned by root with mode 600."
+fi
+
+# conf <key>: a value from the config file, or nothing.
+conf() {
+    sed -n "s/^$1=//p" "$conf_file" | tail -n 1
+}
+
+remote=$(conf remote)
+port=$(conf port)
+remote_dir=$(conf remote_dir)
+user=$(conf user)
+domain=$(conf domain)
+database=$(conf database)
+php=$(conf php)
+
+for key in remote port remote_dir user domain database php; do
+    if [[ -z ${!key} ]]; then
+        die "$conf_file has no $key= (see --help)."
+    fi
+done
+
+if [[ ! $remote =~ ^[a-z0-9._-]+@[a-z0-9.-]+$ || ! $port =~ ^[0-9]+$ ]]; then
+    die "remote= must be account@host and port= a number in $conf_file."
+fi
+
+if [[ ! $remote_dir =~ ^[A-Za-z0-9._/-]+$ || $remote_dir == /* || $remote_dir == *..* ]]; then
+    die "remote_dir= must be a folder inside the old account's home in $conf_file."
+fi
+
+if [[ ! $php =~ ^[0-9]+\.[0-9]+$ ]]; then
+    die "php= must be a PHP version (for example 8.2) in $conf_file."
+fi
+
+if ! user_exists "$user"; then
+    die "There is no HestiaCP user $user."
+fi
+
+if ! v-list-web-domain "$user" "$domain" json > /dev/null 2>&1; then
+    die "$user has no web domain $domain. Add it in HestiaCP first."
+fi
+
+if ! v-list-database "$user" "$database" json > /dev/null 2>&1; then
+    die "$user has no database $database. Add it in HestiaCP first."
+fi
+
+db_user=$(v-list-database "$user" "$database" json | jq -r --arg d "$database" '.[$d].DBUSER // ""')
+php_bin="/usr/bin/php$php"
+if [[ ! -x $php_bin ]]; then
+    die "$php_bin is missing. Add PHP $php with v-add-web-php $php first."
+fi
+
+home=$(user_field "$user" HOME)
+web_dir="$home/web/$domain/public_html"
+app_dir="$web_dir/current"
+env_file="$app_dir/.env"
+key_file="$home/.ssh/fetch_$name"
+known_hosts="$home/.ssh/known_hosts"
+
+if [[ -L $app_dir ]]; then
+    die "$app_dir is a symbolic link (a deploy-kit release?). fetch-site copies into a plain folder."
+fi
+
+# as_user <command>...: runs a command as the local user.
+as_user() {
+    runuser -u "$user" -- "$@"
+}
+
+ssh_options=(-i "$key_file" -p "$port" -o BatchMode=yes -o IdentitiesOnly=yes
+    -o StrictHostKeyChecking=accept-new -o "UserKnownHostsFile=$known_hosts" -o ConnectTimeout=15)
+
+# remote_run <script> [args]: runs a bash script on the old server as the
+# remote account, from its home folder, and prints its output.
+remote_run() {
+    local script=$1
+    shift
+    as_user ssh "${ssh_options[@]}" "$remote" bash -s -- "$@" <<< "$script"
+}
+
+# stream <command>...: like run, but shows the command's output as it comes
+# (progress of long copies) instead of collecting it.
+stream() {
+    refuse_in_check_mode "$1"
+    printf '          $ %s\n' "$*"
+    "$@" || die "'$1' failed (output above)."
+}
+
+seconds_since() {
+    echo $(($(date +%s) - $1))
+}
+
+if $check_only; then
+    echo "Checking the copy of $name: $remote -> $domain (nothing will be copied)"
+else
+    echo "Fetching a fresh copy of $name: $remote -> $domain"
+fi
+
+started=$(date +%s)
+
+section 'SSH to the old server'
+
+if [[ -f $key_file ]]; then
+    ok "key ${key_file/#$home/\~}"
+elif needs "key ${key_file/#$home/\~}"; then
+    run runuser -u "$user" -- mkdir -p -m 700 "$home/.ssh"
+    run runuser -u "$user" -- ssh-keygen -q -t ed25519 -N '' -C "$(hostname -s)-fetch" -f "$key_file"
+    added "key ${key_file/#$home/\~}"
+fi
+
+if [[ ! -f $key_file ]] || ! as_user ssh "${ssh_options[@]}" "$remote" true > /dev/null 2>&1; then
+    server_ip=$(v-list-sys-ips plain 2> /dev/null | head -n 1 | cut -f 1)
+    todo "the old server does not accept the key yet. In the old account ($remote), run:"
+    echo '          mkdir -p -m 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+    echo '          and add this line to ~/.ssh/authorized_keys (from= lets it log in from this server only):'
+    echo
+    if [[ -f $key_file ]]; then
+        printf '          from="%s" %s\n' "${server_ip:-<this server>}" "$(cut -d ' ' -f 1,2 "$key_file.pub") $(hostname -s)-fetch"
+    fi
+    echo
+    echo '          Then run this again.'
+    finish
+fi
+
+ok "logs in to $remote (port $port)"
+
+# Read-only look at the old site. Prints key=value lines; never a password.
+# The single-quoted scripts below run on the old server, so their $ stay as they are.
+# shellcheck disable=SC2016
+inspect=$(remote_run '
+    set -u
+    cd "$1" 2> /dev/null || { echo "missing=$1"; exit 0; }
+    get() { grep -E "^$1=" .env 2> /dev/null | tail -n 1 | cut -d= -f2- | sed -e "s/^\"\(.*\)\"$/\1/" -e "s/^'"'"'\(.*\)'"'"'$/\1/"; }
+    echo "dir=$(pwd -P)"
+    [ -f artisan ] && echo "artisan=yes"
+    [ -f .env ] && echo "env=yes"
+    echo "filesystem=$(get FILESYSTEM_DISK)"
+    echo "laravel=$(php artisan --version 2> /dev/null)"
+    echo "php=$(php -r "echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION;")"
+    command -v mysqldump > /dev/null && echo "mysqldump=yes"
+    [ -f storage/framework/down ] && echo "down=yes"
+    true
+' "$remote_dir" 2>&1 || true)
+
+remote_value() {
+    sed -n "s/^$1=//p" <<< "$inspect" | tail -n 1
+}
+
+if [[ -n $(remote_value missing) ]]; then
+    die "There is no folder $remote_dir in $remote's home."
+fi
+
+if [[ $(remote_value artisan) != yes || $(remote_value env) != yes ]]; then
+    die "$remote:$remote_dir has no artisan or no .env: not a Laravel app."
+fi
+
+if [[ $(remote_value mysqldump) != yes ]]; then
+    die "The old server has no mysqldump for $remote."
+fi
+
+ok "$remote:$(remote_value dir): $(remote_value laravel), PHP $(remote_value php)"
+
+case $(remote_value filesystem) in
+    '' | local | public) ok "files stay on the old server's disk (FILESYSTEM_DISK=$(remote_value filesystem))" ;;
+    *) die "The old site keeps files in '$(remote_value filesystem)' (FILESYSTEM_DISK), not on its disk: a copy would share them. Nothing was copied." ;;
+esac
+
+if [[ $(remote_value php) != "$php" ]]; then
+    warn "the old server runs PHP $(remote_value php), this copy $php (php= in $conf_file)"
+fi
+
+if [[ $(remote_value down) == yes ]]; then
+    say note 'the old site is in maintenance mode (php artisan down)'
+fi
+
+section "Domain $domain"
+
+domain_json=$(v-list-web-domain "$user" "$domain" json)
+backend=$(jq -r --arg d "$domain" '.[$d].BACKEND // ""' <<< "$domain_json")
+web_tpl=$(jq -r --arg d "$domain" '.[$d].TPL // ""' <<< "$domain_json")
+proxy_tpl=$(jq -r --arg d "$domain" '.[$d].PROXY // ""' <<< "$domain_json")
+wanted_backend="PHP-${php/./_}"
+
+if [[ $backend == "$wanted_backend" ]]; then
+    ok "PHP-FPM backend $backend"
+elif needs "PHP-FPM backend $wanted_backend (now ${backend:-none})"; then
+    run v-change-web-domain-backend-tpl "$user" "$domain" "$wanted_backend"
+    added "PHP-FPM backend $wanted_backend"
+fi
+
+if [[ $web_tpl == laravel ]]; then
+    ok 'web template laravel (web root current/public)'
+elif needs "web template laravel (now ${web_tpl:-none})"; then
+    run v-change-web-domain-tpl "$user" "$domain" laravel
+    added 'web template laravel (web root current/public)'
+fi
+
+if [[ $proxy_tpl == laravel ]]; then
+    ok 'proxy template laravel'
+elif needs "proxy template laravel (now ${proxy_tpl:-none})"; then
+    run v-change-web-domain-proxy-tpl "$user" "$domain" laravel
+    added 'proxy template laravel'
+fi
+
+if [[ -n $(jq -r --arg d "$domain" '.[$d].AUTH_USER // ""' <<< "$domain_json") ]]; then
+    ok 'password protected (HTTP auth)'
+else
+    warn "not password protected: v-add-web-domain-httpauth $user $domain <name> <password>"
+fi
+
+if $check_only; then
+    if [[ -f $env_file ]]; then
+        ok "copy present: ${app_dir/#$home/\~} ($(du -sh "$app_dir" 2> /dev/null | cut -f 1))"
+    else
+        later 'no copy yet: run this without --check'
+    fi
+    finish
+fi
+
+section 'Database'
+
+phase=$(date +%s)
+
+# The local database login: kept from the copy's .env when it works,
+# otherwise a new password set through HestiaCP.
+db_password=''
+if [[ -f $env_file ]]; then
+    db_password=$(grep -E '^DB_PASSWORD=' "$env_file" | tail -n 1 | cut -d= -f2- | sed -e 's/^"\(.*\)"$/\1/')
+fi
+
+if [[ -z $db_password ]] || ! printf '[client]\npassword="%s"\n' "$db_password" | mariadb --defaults-file=/dev/stdin -h 127.0.0.1 -u "$db_user" -e 'SELECT 1' "$database" > /dev/null 2>&1; then
+    db_password=$(random_password)
+    make_secret_file "$db_password"
+    run v-change-database-password "$user" "$database" "$secret_path"
+    added "a new password for the database login $db_user"
+fi
+
+# Empty the local database first, so tables gone on the old server go here too.
+tables=$(mariadb -N -e "SELECT CONCAT('\`', table_name, '\`') FROM information_schema.tables WHERE table_schema = '$database'" | paste -sd ',' -)
+if [[ -n $tables ]]; then
+    run mariadb -e "SET FOREIGN_KEY_CHECKS = 0; DROP TABLE IF EXISTS $tables;" "$database"
+fi
+
+# On the old server: read the login from the app's .env and dump. The
+# password stays there (MYSQL_PWD, never on a command line).
+# shellcheck disable=SC2016
+dump_script='
+    set -eu
+    set -o pipefail
+    cd "$1"
+    get() { grep -E "^$1=" .env | tail -n 1 | cut -d= -f2- | sed -e "s/^\"\(.*\)\"$/\1/" -e "s/^'"'"'\(.*\)'"'"'$/\1/"; }
+    MYSQL_PWD=$(get DB_PASSWORD)
+    export MYSQL_PWD
+    port=$(get DB_PORT)
+    options="--single-transaction --quick --skip-lock-tables --no-tablespaces --default-character-set=utf8mb4"
+    if mysqldump --help 2> /dev/null | grep -q column-statistics; then
+        options="$options --column-statistics=0"
+    fi
+    # shellcheck disable=SC2086
+    mysqldump $options -h "$(get DB_HOST)" -P "${port:-3306}" -u "$(get DB_USERNAME)" "$(get DB_DATABASE)" | gzip -1
+'
+
+printf '          $ mysqldump on %s | gzip | ssh | gunzip | mariadb %s\n' "$remote" "$database"
+dump_file=$(mktemp /tmp/deploy-kit.XXXXXXXX)
+temp_files+=("$dump_file")
+
+if ! remote_run "$dump_script" "$remote_dir" > "$dump_file" || ! gzip -t "$dump_file" 2> /dev/null; then
+    die "The dump on the old server failed. The local database is now empty; run this again."
+fi
+
+# MySQL 8's default collation is unknown to MariaDB before 11.4.
+if ! gunzip -c "$dump_file" | sed -e 's/utf8mb4_0900_ai_ci/utf8mb4_unicode_ci/g' | mariadb "$database"; then
+    die "Importing into $database failed (output above). Run this again."
+fi
+
+table_count=$(mariadb -N -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '$database'")
+added "$database: $table_count tables, $(du -h "$dump_file" | cut -f 1) compressed ($(seconds_since "$phase") s)"
+
+section 'Files'
+
+phase=$(date +%s)
+
+if [[ ! -d $app_dir ]]; then
+    run runuser -u "$user" -- mkdir -p "$app_dir"
+fi
+
+# Kept here (not copied, never deleted): .env, logs, caches, sessions.
+# Every file is the local user's, 644 and folders 755, whatever they were.
+stream runuser -u "$user" -- rsync -rlpt --delete --info=stats1,progress2 \
+    --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
+    --exclude=/.env --exclude=/node_modules/ \
+    --exclude='/storage/logs/**' --exclude='/storage/framework/cache/**' \
+    --exclude='/storage/framework/sessions/**' --exclude='/storage/framework/views/**' \
+    --exclude='/bootstrap/cache/*.php' \
+    -e "ssh ${ssh_options[*]}" "$remote:${remote_dir%/}/" "$app_dir/"
+
+for folder in storage/logs storage/framework/cache/data storage/framework/sessions storage/framework/views bootstrap/cache; do
+    as_user mkdir -p "$app_dir/$folder"
+done
+
+# A public/storage link points at the old server's path: point it here.
+if [[ -L $app_dir/public/storage ]]; then
+    run runuser -u "$user" -- ln -sfn ../storage/app/public "$app_dir/public/storage"
+fi
+
+added "${app_dir/#$home/\~}: $(du -sh "$app_dir" | cut -f 1) ($(seconds_since "$phase") s)"
+
+section '.env'
+
+old_env=$(mktemp /tmp/deploy-kit.XXXXXXXX)
+temp_files+=("$old_env")
+# shellcheck disable=SC2016
+remote_run 'cd "$1" && cat .env' "$remote_dir" > "$old_env" || die "Could not read the old site's .env."
+
+new_env=$(mktemp /tmp/deploy-kit.XXXXXXXX)
+temp_files+=("$new_env")
+
+# The old .env without the keys this copy sets, and without a session or
+# Sanctum domain, which would tie logins to the old domain.
+grep -vE '^(APP_URL|DB_HOST|DB_PORT|DB_DATABASE|DB_USERNAME|DB_PASSWORD|MAIL_MAILER|BROADCAST_DRIVER|QUEUE_CONNECTION|SESSION_DOMAIN|SANCTUM_STATEFUL_DOMAINS)=' "$old_env" > "$new_env" || true
+if [[ -s $new_env && -n $(tail -c 1 "$new_env") ]]; then
+    echo >> "$new_env"
+fi
+printf '%s\n' \
+    '' \
+    "# fetch-site ($name): this copy's own values." \
+    "APP_URL=https://$domain" \
+    'DB_HOST=127.0.0.1' \
+    'DB_PORT=3306' \
+    "DB_DATABASE=$database" \
+    "DB_USERNAME=$db_user" \
+    "DB_PASSWORD=$db_password" \
+    '# A copy never emails, notifies or broadcasts to the live site'"'"'s users.' \
+    'MAIL_MAILER=log' \
+    'BROADCAST_DRIVER=log' \
+    'QUEUE_CONNECTION=sync' >> "$new_env"
+
+run install -o "$user" -g "$user" -m 600 "$new_env" "$env_file"
+added ".env: the old site's, with this copy's URL and database; mail, broadcasting and the queue local"
+
+section 'Checks'
+
+phase=$(date +%s)
+
+artisan() {
+    (cd "$app_dir" && as_user "$php_bin" artisan "$@")
+}
+
+if output=$(artisan optimize:clear 2>&1); then
+    ok 'caches cleared (optimize:clear)'
+else
+    warn "artisan optimize:clear: $(tail -n 2 <<< "$output" | tr -s ' \n' ' ')"
+fi
+
+if output=$(artisan migrate:status 2>&1) && grep -q 'Ran' <<< "$output"; then
+    ok "the app reads its database ($(grep -c 'Ran' <<< "$output") migrations ran)"
+else
+    warn "the app cannot read its database: $(tail -n 3 <<< "$output" | tr -s ' \n' ' ')"
+fi
+
+if [[ -x /usr/local/bin/composer ]]; then
+    if output=$(cd "$app_dir" && as_user env HOME="$home" COMPOSER_HOME="$home/.composer" "$php_bin" /usr/local/bin/composer check-platform-reqs --no-dev --no-interaction 2>&1); then
+        ok "PHP $php has every extension vendor/ needs"
+    else
+        warn "PHP $php lacks what vendor/ needs: $(grep -iE 'missing|failed' <<< "$output" | head -n 3 | tr -s ' \n' ' ')"
+    fi
+fi
+
+code=$(curl -sS -o /dev/null --max-time 20 -w '%{http_code}' "https://$domain/login" 2> /dev/null || true)
+case $code in
+    200 | 302) ok "https://$domain/login answers $code" ;;
+    401) ok "https://$domain/login asks for the HTTP password (401)" ;;
+    *) warn "https://$domain/login answers $code (${app_dir/#$home/\~}/storage/logs may say why)" ;;
+esac
+
+say note "fetched in $(seconds_since "$started") s"
+
+finish
