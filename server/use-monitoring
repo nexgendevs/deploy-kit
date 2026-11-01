@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+#
+# Connects a domain to its app's Sentry project and keeps its logs for two
+# weeks, or checks it. Once per domain, as root, once the app's monitoring
+# change (sentry/sentry-laravel) is deployed. See server/README.md.
+
+# shellcheck source=server/lib.sh
+source "$(dirname "$(readlink -f "$0")")/lib.sh"
+
+usage() {
+    cat << 'TEXT'
+Usage: use-monitoring [--check] [--php <version>] <user> <domain>
+
+Sends <domain>'s errors to its app's Sentry project, with the domain as the
+environment, and rotates its log daily:
+  - asks for the project's DSN (Sentry: project settings, Client Keys) and
+    keeps it in shared/.env; a DSN already there stays
+  - backs up shared/.env, then sets SENTRY_LARAVEL_DSN,
+    SENTRY_ENVIRONMENT=<domain>, LOG_STACK=daily and LOG_DAILY_DAYS=14,
+    and rebuilds the config cache (artisan optimize)
+  - sends one test event (artisan sentry:test) when the DSN is new: it shows
+    up in Sentry and tests the alert email
+  - checks the app reports to Sentry with its data collection limits, logs
+    daily, /up answers 200, and, for an app with Horizon, the scheduler
+    queues the heartbeat that Sentry's cron monitor waits for
+The uptime monitor for /up is added in Sentry itself.
+
+--check  only report; change nothing (and send nothing)
+--php    PHP version, as in the app's deploy.php (default 8.4)
+
+Running it again is safe: it only changes what is missing.
+TEXT
+}
+
+php=8.4
+args=()
+
+while (($# > 0)); do
+    case $1 in
+        --check) check_only=true ;;
+        --php)
+            php=${2:-}
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -*) die "Unknown option $1 (see --help)." ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+
+if ((${#args[@]} != 2)); then
+    usage
+    exit 1
+fi
+
+user=${args[0]}
+domain=${args[1]}
+
+if [[ ! $user =~ ^[a-z][a-z0-9_-]*$ ]]; then
+    die "'$user' is not a valid user name."
+fi
+
+if [[ ! $domain =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+    die "'$domain' is not a domain name (lower case, no scheme or path)."
+fi
+
+if [[ ! $php =~ ^[0-9]+\.[0-9]+$ ]]; then
+    die "'$php' is not a PHP version (for example 8.4)."
+fi
+
+require_root_and_hestia
+
+if ! user_exists "$user"; then
+    die "There is no HestiaCP user $user."
+fi
+
+home=$(user_field "$user" HOME)
+env_file="$home/web/$domain/public_html/shared/.env"
+current="$home/web/$domain/public_html/current"
+php_bin="/usr/bin/php$php"
+
+if [[ -L $env_file || ! -s $env_file ]]; then
+    die "$env_file is missing (or a symbolic link). Set the domain up with add-domain first."
+fi
+
+if [[ ! -L $current ]]; then
+    die "$domain is not deployed yet. Deploy the app first."
+fi
+
+if [[ ! -d $current/vendor/sentry/sentry-laravel ]]; then
+    die "The deployed app has no sentry/sentry-laravel. Deploy the app's monitoring change first; nothing was changed."
+fi
+
+if $check_only; then
+    echo "Checking monitoring for $domain (nothing will be changed or sent)"
+else
+    echo "Connecting $domain to Sentry"
+fi
+
+artisan() {
+    runuser -u "$user" -- "$php_bin" "$current/artisan" "$@"
+}
+
+# A Sentry DSN: https://<public key>@o<org>.ingest[.<region>].sentry.io/<project>
+dsn_pattern='^https://[0-9a-f]{32}@o[0-9]+\.ingest(\.[a-z]+)?\.sentry\.io/[0-9]+$'
+
+section 'Sentry DSN'
+
+dsn=$(env_value SENTRY_LARAVEL_DSN)
+new_dsn=false
+
+if [[ -n $dsn && $dsn =~ $dsn_pattern ]]; then
+    ok "SENTRY_LARAVEL_DSN set (project ${dsn##*/})"
+elif [[ -n $dsn ]]; then
+    warn 'SENTRY_LARAVEL_DSN in shared/.env does not look like a Sentry DSN'
+elif needs "SENTRY_LARAVEL_DSN: the DSN of the app's Sentry project"; then
+    if [[ ! -t 0 ]]; then
+        die 'Run this in a terminal: it asks for the DSN.'
+    fi
+
+    echo "          Paste the DSN of the app's Sentry project (Project settings, Client Keys),"
+    echo '          or press Enter to skip:'
+    read -r dsn || true
+    dsn=${dsn//[[:space:]]/}
+
+    if [[ -z $dsn ]]; then
+        todo 'SENTRY_LARAVEL_DSN: run this again and paste the DSN'
+    elif [[ ! $dsn =~ $dsn_pattern ]]; then
+        die 'That is not a Sentry DSN (https://<key>@o<number>.ingest...sentry.io/<number>). Nothing was changed.'
+    else
+        new_dsn=true
+    fi
+fi
+
+# Health data stays in the EU: an EU organisation's DSNs end in ingest.de.sentry.io.
+if [[ -n $dsn && $dsn =~ $dsn_pattern && $dsn != *'.ingest.de.sentry.io/'* ]]; then
+    warn 'the DSN is not in Sentry'"'"'s EU region (ingest.de.sentry.io): events would be stored outside the EU'
+fi
+
+section 'shared/.env'
+
+keys=(SENTRY_ENVIRONMENT LOG_STACK LOG_DAILY_DAYS)
+values=("$domain" daily 14)
+
+if $new_dsn; then
+    keys=(SENTRY_LARAVEL_DSN "${keys[@]}")
+    values=("$dsn" "${values[@]}")
+fi
+
+changes=()
+
+for i in "${!keys[@]}"; do
+    if [[ $(env_value "${keys[i]}") != "${values[i]}" ]]; then
+        changes+=("$i")
+    fi
+done
+
+env_changed=false
+
+if ((${#changes[@]} == 0)); then
+    ok "SENTRY_ENVIRONMENT=$domain, LOG_STACK=daily, LOG_DAILY_DAYS=14"
+else
+    names=$(for i in "${changes[@]}"; do printf '%s ' "${keys[i]}"; done)
+
+    if needs "set ${names% } in shared/.env"; then
+        backup_env
+
+        for i in "${changes[@]}"; do
+            set_env "${keys[i]}" "${values[i]}"
+        done
+
+        env_changed=true
+        added "${names% } (backup: shared/$(basename "$env_backup"))"
+    fi
+fi
+
+if $env_changed; then
+    optimize_or_restore
+fi
+
+section 'Checks'
+
+if $check_only && ((${#changes[@]} > 0)); then
+    later 'the app, Sentry and site checks: once this runs'
+    finish
+fi
+
+about=$(artisan about --only=sentry,drivers --json 2> /dev/null || true)
+sentry_enabled=$(jq -r '.sentry.enabled // ""' <<< "$about" 2> /dev/null || true)
+sentry_environment=$(jq -r '.sentry.environment // ""' <<< "$about" 2> /dev/null || true)
+data_collection=$(jq -r '.sentry.data_collection // ""' <<< "$about" 2> /dev/null || true)
+logs=$(jq -r '.drivers.logs | if type == "array" then join(",") else . end // ""' <<< "$about" 2> /dev/null || true)
+
+if [[ $sentry_enabled == YES && $sentry_environment == "$domain" ]]; then
+    ok "the app reports to Sentry as environment $domain"
+else
+    warn "the app's Sentry: enabled ${sentry_enabled:-?}, environment ${sentry_environment:-?} (config cache stale? run artisan optimize)"
+fi
+
+if [[ $data_collection == ENABLED ]]; then
+    ok "the app limits what Sentry collects (config/sentry.php data_collection)"
+else
+    warn "the app's config/sentry.php sets no data_collection: Sentry would collect request bodies and SQL values"
+fi
+
+if [[ $logs == daily ]]; then
+    ok 'the app logs to a daily file, kept 14 days'
+else
+    warn "the app logs to ${logs:-?}, not daily"
+fi
+
+if $new_dsn; then
+    test_output=$(artisan sentry:test 2>&1 || true)
+
+    if [[ $test_output == *'Test event sent with ID'* ]]; then
+        ok "test event sent to Sentry ($(grep -o 'ID: [0-9a-f]*' <<< "$test_output" | head -n 1)): it should show up there, with an alert email"
+    else
+        warn "the test event was not sent: $(tr -s ' \n' ' ' <<< "$test_output" | head -c 300)"
+    fi
+fi
+
+# The heartbeat goes through the queue, so it needs Horizon.
+if [[ -d $current/vendor/laravel/horizon ]]; then
+    if artisan schedule:list 2> /dev/null | grep -q 'QueueHeartbeat'; then
+        ok "the scheduler queues the heartbeat every five minutes (Sentry cron monitor queue-heartbeat)"
+    else
+        warn 'the deployed app has no QueueHeartbeat in its schedule'
+    fi
+fi
+
+up=$(curl -sS -o /dev/null --max-time 15 -w '%{http_code}' "https://$domain/up" 2> /dev/null || true)
+
+if [[ $up == 200 ]]; then
+    ok "https://$domain/up answers 200 (Sentry's uptime monitor watches it)"
+else
+    warn "https://$domain/up answers $up (shared/storage/logs may say why)"
+fi
+
+if [[ -f $home/web/$domain/public_html/shared/storage/logs/laravel.log && $logs == daily ]]; then
+    say note 'shared/storage/logs/laravel.log is from before daily logs and can be deleted'
+fi
+
+finish

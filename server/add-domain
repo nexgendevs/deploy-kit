@@ -529,6 +529,15 @@ elif [[ -n $reverb_domain && -d $current/vendor/pusher/pusher-php-server ]]; the
     fi
 fi
 
+# Errors go to Sentry once the app has its SDK (use-monitoring sets it up).
+if [[ -d $current/vendor/sentry/sentry-laravel ]]; then
+    if [[ -n $(env_value SENTRY_LARAVEL_DSN) && $(env_value SENTRY_ENVIRONMENT) == "$domain" ]]; then
+        ok "reports to Sentry as environment $domain"
+    else
+        todo "monitoring: run use-monitoring $user $domain"
+    fi
+fi
+
 url="https://$domain"
 
 code=$(http_code "$url/up")
