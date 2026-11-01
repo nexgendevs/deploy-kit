@@ -55,8 +55,8 @@ jobs:
       # the scripts look for root or HestiaCP.
       - name: Check the server scripts
         run: |
-          shellcheck --external-sources server/lib.sh server/add-user server/add-domain server/setup-redis server/use-redis server/use-horizon server/setup-reverb server/use-reverb
-          for script in add-user add-domain setup-redis use-redis use-horizon setup-reverb use-reverb; do
+          shellcheck --external-sources server/lib.sh server/add-user server/add-domain server/setup-redis server/use-redis server/use-horizon server/setup-reverb server/use-reverb server/use-monitoring
+          for script in add-user add-domain setup-redis use-redis use-horizon setup-reverb use-reverb use-monitoring; do
             "server/$script" --help > /dev/null
           done
 

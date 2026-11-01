@@ -11,6 +11,7 @@ The one-time steps for a HestiaCP server that hosts apps deployed with deploy-ki
 | `use-horizon` | once per domain, when its app has `laravel/horizon` | runs its queue with Horizon under Supervisor |
 | `setup-reverb` | once per server, on the domain of a Reverb server app | the shared Reverb (WebSocket) server: Supervisor, nginx wss proxy |
 | `use-reverb` | once per domain whose app broadcasts | the domain's own Reverb app and its `REVERB_*` settings |
+| `use-monitoring` | once per domain, when its app has `sentry/sentry-laravel` | errors to the app's Sentry project, daily logs |
 
 All run as root, only add what is missing (running them again is safe), and with `--check` only report. Like the rest of this repository, nothing here names a server, a client or a secret: those are arguments, or live in each app's `docs/deployment.md`.
 
@@ -100,7 +101,7 @@ The whole sequence for a new domain:
 2. **`add-domain`:** web domain with the PHP-FPM backend, Let's Encrypt, HTTPS redirect and HSTS, no custom document root, both `laravel` templates (checked in the generated Apache and nginx files), `shared/.env`, then the database and the domain's Redis user with the passwords from `shared/.env`. The new `.env` has only what every app needs: `APP_ENV`, a new `APP_KEY`, `APP_DEBUG=false`, `APP_URL`, `LOG_LEVEL`, the database login, `SESSION_SECURE_COOKIE=true`, and cache and sessions in Redis (`CACHE_STORE`, `SESSION_DRIVER`, the `REDIS_*` login, the ports and the prefix `<domain>:`). The app's `config/database.php` must read `REDIS_CACHE_PORT` for its `cache` connection, so caches go to the cache instance.
 3. **The app's own settings:** add them to `shared/.env` as the user, before the first deploy. The app's `docs/deployment.md` lists them (`APP_NAME`, queue, mail…).
 4. **Deploy:** add the site to the app's `deploy.php` and deploy.
-5. **`add-domain` again:** adds the scheduler's cron entry, then checks the site: `/up` answers 200, HTTP redirects to HTTPS, the HSTS header is sent, and `/.env`, `/shared/.env`, `/composer.json` and the like answer 404. The cron entry waits for the first deploy because HestiaCP emails cron output to the user's contact address, and `cd current` would fail every minute until then. It also reports what the app needs from the scripts below: `use-horizon` for an app with Horizon, `use-reverb` for an app that can broadcast.
+5. **`add-domain` again:** adds the scheduler's cron entry, then checks the site: `/up` answers 200, HTTP redirects to HTTPS, the HSTS header is sent, and `/.env`, `/shared/.env`, `/composer.json` and the like answer 404. The cron entry waits for the first deploy because HestiaCP emails cron output to the user's contact address, and `cd current` would fail every minute until then. It also reports what the app needs from the scripts below: `use-horizon` for an app with Horizon, `use-reverb` for an app that can broadcast, `use-monitoring` for an app with the Sentry SDK.
 6. **First administrator:** the app's `docs/deployment.md`.
 
 The script never changes an existing `shared/.env`. It only reports problems it finds there (the wrong `APP_URL`, a database login that fails, and with `--live` an `APP_ENV` other than production or `APP_DEBUG` not false), and you fix them by hand.
@@ -190,6 +191,21 @@ Once the server runs and the app's broadcasting change is deployed (Laravel's `r
 
 `VITE_*` values are built into the app's JavaScript when a release is built, so browsers get the key with the next deploy. Until then the script reports that the deployed build has no key.
 
+## A domain's errors to Sentry: `use-monitoring`
+
+Errors go to [Sentry](https://sentry.io): one Sentry project per app, and within it one environment per domain. Once the app's `sentry/sentry-laravel` is deployed, once per domain:
+
+```bash
+/opt/deploy-kit/server/use-monitoring <user> <domain>
+```
+
+1. asks for the project's DSN (Sentry: project settings, Client Keys) and keeps it in `shared/.env`. Paste it straight from Sentry; it never appears in the output. It warns about a DSN outside Sentry's EU region (`ingest.de.sentry.io`);
+2. backs up `shared/.env`, then sets `SENTRY_LARAVEL_DSN`, `SENTRY_ENVIRONMENT=<domain>`, `LOG_STACK=daily` and `LOG_DAILY_DAYS=14` (Laravel's own log, one file a day, kept two weeks), and rebuilds the config cache;
+3. with a new DSN, sends one test event (`artisan sentry:test`). It shows up in Sentry and, with the project's default alert rule, as an email;
+4. checks that the app reports to Sentry as its domain, that its `config/sentry.php` limits what Sentry collects (`data_collection`), that it logs daily, that `/up` answers, and, for an app with Horizon, that its scheduler queues the heartbeat job.
+
+The apps decide what a report may carry, not this script: for health data, no user, cookies, request bodies, query strings, SQL values, job payloads or frame variables, and query errors with `?` placeholders (`mask_bindings_in_exception_messages`). They also do the two things Sentry watches from outside. The **heartbeat**, queued by the scheduler every five minutes and run by Horizon, checks in with a Sentry cron monitor, which alerts when the check-ins stop: the scheduler or the queue is down. **`/up`** asks the database and Redis too (the Reverb server's asks Reverb), and a Sentry uptime monitor per domain, added in Sentry itself, checks it from outside.
+
 ## Checking: `--check`
 
 `--check` changes nothing: every change goes through one function that refuses to run in this mode. It is safe on live servers at any time, for example after a HestiaCP upgrade:
@@ -219,5 +235,6 @@ Each line is `ok`, `added`, `todo` (missing, and the script can add it), `warn` 
 - Database: `<user>_<name>`, with a login of the same name.
 - Redis: one ACL user per domain, named after the domain, on both instances with the same password (`REDIS_USERNAME` / `REDIS_PASSWORD`), limited to keys under `REDIS_PREFIX=<domain>:`. A Horizon prefix must start with it too (`<domain>:horizon:`).
 - Horizon: Supervisor program `<domain>-horizon`, log `/var/log/supervisor/<domain>-horizon.log`.
+- Sentry: one project per app, `SENTRY_ENVIRONMENT=<domain>`, a cron monitor `queue-heartbeat` per app (its environments are the domains) and an uptime monitor per domain on `https://<domain>/up`.
 - Reverb: one server per machine, Supervisor program `<Reverb domain>-reverb` on `127.0.0.1:8090`, recorded in `/etc/deploy-kit/reverb.conf`. One Reverb app per domain: `<domain>.json` in the server's `shared/reverb-apps/`, allowed from its own domain only.
-- `shared/.env`: mode 600, owned by the user, written once by `add-domain`. Deploys never change it. `use-redis`, `use-horizon`, `setup-reverb` and `use-reverb` change only their own keys, after a backup (`.env.bak-<date>`).
+- `shared/.env`: mode 600, owned by the user, written once by `add-domain`. Deploys never change it. `use-redis`, `use-horizon`, `setup-reverb`, `use-reverb` and `use-monitoring` change only their own keys, after a backup (`.env.bak-<date>`).
